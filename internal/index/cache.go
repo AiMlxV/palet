@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Thitipong-PP/palet/internal/plugin"
 )
@@ -77,7 +78,12 @@ func LoadCached() []Entry {
 		_ = writeCacheFile(path, cf) // best-effort
 	}
 
-	return Build(plugins)
+	entries := Build(plugins)
+	if strings.EqualFold(os.Getenv("PALET_SYSTEM"), "off") {
+		return entries
+	}
+	entries = append(entries, systemEntries()...)
+	return entries
 }
 
 // hashFile returns an md5 hex string based on file size + mtime.

@@ -22,9 +22,9 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	cBrand   = lipgloss.Color("#FF8383") // brand pink
-	cBrand2  = lipgloss.Color("#FFC193") // soft violet
-	cBlue    = lipgloss.Color("#FFEDCE")
+	cBrand   = lipgloss.Color("#8eb0ff") // brand pink
+	cBrand2  = lipgloss.Color("#a8c2ff") // soft violet
+	cBlue    = lipgloss.Color("#e2eafc")
 	cText    = lipgloss.Color("231")
 	cSubtle  = lipgloss.Color("252")
 	cMuted   = lipgloss.Color("245")
@@ -99,6 +99,7 @@ type model struct {
 	searchInput textinput.Model
 	cursor      int // index into flat (entries only, never headers)
 	listOffset  int // first visible display row
+	lastQuery   string
 
 	// form view
 	selected index.Entry
@@ -107,13 +108,19 @@ type model struct {
 	formErr  string
 
 	// result view
-	builtCmd string
-	buildErr error
-	copyMsg  string
-	copyErr  bool
+	builtCmd    string
+	buildErr    error
+	resultInput textinput.Model
+	copyMsg     string
+	copyErr     bool
 
 	width  int
 	height int
+
+	scanCurrent int
+	scanTotal   int
+	scanName    string
+	scanActive  bool
 
 	// read by Start after the program exits.
 	pendingAction string
@@ -138,7 +145,16 @@ func Start(entries []index.Entry) error {
 	}
 	m.applySearch("")
 
-	final, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	go func() {
+		for msg := range index.ScanProgressChan() {
+			p.Send(msg)
+		}
+	}()
+	if msg, ok := index.CurrentScanProgress(); ok {
+		p.Send(msg)
+	}
+	final, err := p.Run()
 	if err != nil {
 		return err
 	}
@@ -170,7 +186,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for i := range m.inputs {
 			m.inputs[i].Width = max(10, m.width-14)
 		}
+		if m.resultInput.Value() != "" {
+			m.resultInput.Width = max(10, m.width-14)
+		}
 		m.clampOffset()
+		return m, nil
+
+	case index.ScanProgress:
+		m.scanCurrent = msg.Current
+		m.scanTotal = msg.Total
+		m.scanName = msg.Name
+		m.scanActive = !msg.Done && msg.Total > 0
 		return m, nil
 
 	case tea.KeyMsg:
@@ -250,6 +276,8 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // applySearch refilters the entries and rebuilds the grouped + flat views.
 func (m *model) applySearch(query string) {
+	changed := query != m.lastQuery
+	m.lastQuery = query
 	results := search.Query(m.all, query)
 	m.groups = buildGroups(results)
 
@@ -258,11 +286,15 @@ func (m *model) applySearch(query string) {
 		m.flat = append(m.flat, g.entries...)
 	}
 
-	if m.cursor >= len(m.flat) {
-		m.cursor = len(m.flat) - 1
-	}
-	if m.cursor < 0 {
+	if changed {
 		m.cursor = 0
+	} else {
+		if m.cursor >= len(m.flat) {
+			m.cursor = len(m.flat) - 1
+		}
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
 	}
 	m.listOffset = 0
 	m.clampOffset()
@@ -317,6 +349,13 @@ func (m model) viewList() string {
 	for _, r := range rows[top:bottom] {
 		b.WriteString(r + "\n")
 	}
+	if m.scanActive {
+		label := fmt.Sprintf("scan %d/%d", m.scanCurrent, m.scanTotal)
+		if m.scanName != "" {
+			label += " " + m.scanName
+		}
+		b.WriteString("\n  " + styleDim.Render(label) + "\n")
+	}
 
 	b.WriteString("\n" + renderHints([]keyHint{
 		{"↑/↓", "navigate"}, {"enter", "select"}, {"esc", "clear"}, {"q", "quit"},
@@ -361,7 +400,11 @@ func (m model) listRows() (rows []string, cursorRow int) {
 
 func (m model) renderEntry(e index.Entry, selected bool) string {
 	const nameW = 16
-	name := pad(e.Command.Name, nameW)
+	name := e.Command.Name
+	if e.Plugin.Description == "system command" && e.Command.Name != e.Plugin.Name {
+		name = e.Plugin.Name + " " + e.Command.Name
+	}
+	name = pad(name, nameW)
 	desc := e.Command.Description
 
 	if selected {
@@ -387,8 +430,14 @@ func (m model) renderEntry(e index.Entry, selected bool) string {
 // listHeight is how many list rows fit between the chrome (brand bar, bordered
 // search field, footer).
 func (m model) listHeight() int {
-	// blank+brand+blank (3) + bordered search (3) + blank (1) + blank+hints (2).
-	h := m.height - 10
+	logoH := lipgloss.Height(m.logoIcon())
+	searchH := lipgloss.Height(m.searchView())
+	// 1 blank + top bar + 2 blanks + logo + 2 blanks + search + 2 blanks + (blank + hints)
+	chrome := logoH + searchH + 10
+	if m.scanActive {
+		chrome++
+	}
+	h := m.height - chrome
 	if h < 3 {
 		h = 3
 	}
@@ -538,6 +587,15 @@ func (m model) submitForm() (tea.Model, tea.Cmd) {
 	cmd, err := executor.BuildCommand(m.selected.Command.Template, vals)
 	m.builtCmd = cmd
 	m.buildErr = err
+	m.resultInput = textinput.New()
+	m.resultInput.Prompt = "$ "
+	m.resultInput.PromptStyle = lipgloss.NewStyle().Foreground(cGreen)
+	m.resultInput.TextStyle = styleCmd
+	m.resultInput.Cursor.Style = lipgloss.NewStyle().Foreground(cBrand)
+	m.resultInput.CharLimit = 2048
+	m.resultInput.Width = max(10, m.w()-14)
+	m.resultInput.SetValue(cmd)
+	m.resultInput.Focus()
 	m.copyMsg = ""
 	m.copyErr = false
 	m.state = viewResult
@@ -560,7 +618,6 @@ func (m model) viewForm() string {
 	b.WriteString("\n")
 
 	if len(cmd.Args) == 0 {
-		b.WriteString("  " + styleDim.Render("This command takes no arguments.") + "\n\n")
 		b.WriteString(renderHints([]keyHint{{"enter", "build"}, {"esc", "back"}}))
 		return b.String()
 	}
@@ -624,7 +681,12 @@ func (m model) viewForm() string {
 
 func (m model) updateResult(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "ctrl+c", "q":
+	case "enter":
+		m.builtCmd = strings.TrimSpace(m.resultInput.Value())
+		m.pendingAction = "execute"
+		return m, tea.Quit
+
+	case "ctrl+c":
 		return m, tea.Quit
 
 	case "esc":
@@ -640,11 +702,8 @@ func (m model) updateResult(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
-	case "e":
-		m.pendingAction = "execute"
-		return m, tea.Quit
-
-	case "c":
+	case "ctrl+o":
+		m.builtCmd = strings.TrimSpace(m.resultInput.Value())
 		if err := executor.Copy(m.builtCmd); err != nil {
 			m.copyMsg = err.Error()
 			m.copyErr = true
@@ -654,7 +713,10 @@ func (m model) updateResult(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	return m, nil
+
+	var cmd tea.Cmd
+	m.resultInput, cmd = m.resultInput.Update(msg)
+	return m, cmd
 }
 
 func (m model) viewResult() string {
@@ -670,8 +732,8 @@ func (m model) viewResult() string {
 	}
 
 	b.WriteString("  " + styleSectionLabel.Render("BUILT COMMAND") + "\n")
-	cmd := lipgloss.NewStyle().Foreground(cGreen).Render("$ ") + styleCmd.Render(m.builtCmd)
-	b.WriteString(m.card(cmd, cCardBd) + "\n")
+	input := m.resultInput.View()
+	b.WriteString(m.card(input, cCardBd) + "\n")
 
 	if m.copyMsg != "" {
 		if m.copyErr {
@@ -683,7 +745,7 @@ func (m model) viewResult() string {
 	b.WriteString("\n")
 
 	b.WriteString(renderHints([]keyHint{
-		{"e", "execute"}, {"c", "copy"}, {"esc", "back"}, {"q", "quit"},
+		{"enter", "execute"}, {"ctrl+o", "copy"}, {"esc", "back"}, {"ctrl+c", "quit"},
 	}))
 	return b.String()
 }
@@ -758,14 +820,29 @@ func (m *model) logoIcon() string {
 	style1 := lipgloss.NewStyle().Foreground(cBrand)
 	style2 := lipgloss.NewStyle().Foreground(cBrand2)
 	style3 := lipgloss.NewStyle().Foreground(cBlue)
+	maxW := m.w() - 2
 
-	row1 := style1.Render("  █████████     █████     ██          ██████████  ███████████")
-	row2 := style2.Render("  ██      ██   ██   ██    ██          ██          ███████████")
-	row3 := style3.Render("  █████████   ██     ██   ██          ████████        ███")
-	row4 := style2.Render("  ██         ███████████  ██          ██              ███")
-	row5 := style1.Render("  ██         ██       ██  ██████████  ██████████      ███")
+	row1 := style1.Render(trimLogoRow("  █████████     █████     ██          ██████████  ███████████", maxW))
+	row2 := style2.Render(trimLogoRow("  ██      ██   ██   ██    ██          ██          ███████████", maxW))
+	row3 := style3.Render(trimLogoRow("  █████████   ██     ██   ██          ████████        ███", maxW))
+	row4 := style2.Render(trimLogoRow("  ██         ███████████  ██          ██              ███", maxW))
+	row5 := style1.Render(trimLogoRow("  ██         ██       ██  ██████████  ██████████      ███", maxW))
 
 	return lipgloss.JoinVertical(lipgloss.Left, row1, row2, row3, row4, row5)
+}
+
+func trimLogoRow(s string, maxW int) string {
+	if maxW <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxW {
+		return s
+	}
+	r := []rune(s)
+	if len(r) > maxW {
+		r = r[:maxW]
+	}
+	return string(r)
 }
 
 // renderHints draws the footer key/label pairs as little keycaps.
