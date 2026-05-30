@@ -1,7 +1,7 @@
 # PALET
 A terminal command palette. Search commands, fill in args, and run — no more memorising flags.
 
-[![asciicast](https://asciinema.org/a/WjfuteL3rRhP4yaK.svg)](https://asciinema.org/a/WjfuteL3rRhP4yaK)
+[![asciicast](https://asciinema.org/a/Ucqx87fnBLxOBOLv.svg)](https://asciinema.org/a/Ucqx87fnBLxOBOLv)
 
 ## Install
 build from source:
