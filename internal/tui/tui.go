@@ -10,9 +10,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Thitipong-PP/palet/internal/config"
 	"github.com/Thitipong-PP/palet/internal/executor"
+	"github.com/Thitipong-PP/palet/internal/history"
 	"github.com/Thitipong-PP/palet/internal/index"
-	"github.com/Thitipong-PP/palet/internal/plugin"
 	"github.com/Thitipong-PP/palet/internal/search"
 	"github.com/Thitipong-PP/palet/internal/validator"
 )
@@ -54,6 +55,8 @@ var (
 
 	styleSectionLabel = lipgloss.NewStyle().Foreground(cFaint).Bold(true)
 
+	styleTag = lipgloss.NewStyle().Foreground(cBrand2)
+
 	styleKeyCap = lipgloss.NewStyle().Foreground(cText).Background(cFainter).Bold(true).Padding(0, 1)
 	styleKeyLbl = lipgloss.NewStyle().Foreground(cMuted)
 )
@@ -81,16 +84,16 @@ const (
 	viewResult
 )
 
-// group is one plugin's bucket of (filtered) entries, preserving the order in
-// which the plugin first appeared in the search results.
+// group is one category's bucket of (filtered) entries, preserving the order in
+// which the category first appeared in the search results.
 type group struct {
-	plugin  string
+	name    string
 	entries []index.Entry
 }
 
 type model struct {
 	all    []index.Entry // immutable full command set
-	groups []group       // current filtered results, grouped by plugin
+	groups []group       // current filtered results, grouped by category
 	flat   []index.Entry // filtered results flattened in display order
 
 	state viewState
@@ -100,12 +103,20 @@ type model struct {
 	cursor      int // index into flat (entries only, never headers)
 	listOffset  int // first visible display row
 	lastQuery   string
+	showHelp    bool
+	statusMsg   string
 
 	// form view
-	selected index.Entry
-	inputs   []textinput.Model
-	focus    int
-	formErr  string
+	selected       index.Entry
+	inputs         []textinput.Model
+	focus          int
+	formErr        string
+	availableFlags []config.Flag
+	flagsLoading   bool
+	flagFilter     textinput.Model
+	selectedFlags  map[string]bool
+	flagCursor     int
+	formSection    int // 0: args inputs, 1: flags section
 
 	// result view
 	builtCmd    string
@@ -126,24 +137,55 @@ type model struct {
 	pendingAction string
 }
 
-// Start opens the Bubble Tea program and, once it closes, runs the built
-// command if the user chose to execute it.
+type flagsLoadedMsg struct {
+	cmdKey string
+	flags  []config.Flag
+}
+
+func loadFlagsCmd(cmdKey string) tea.Cmd {
+	return func() tea.Msg {
+		flags := index.DiscoverCommandFlags(cmdKey)
+		return flagsLoadedMsg{cmdKey: cmdKey, flags: flags}
+	}
+}
+
+// Options defines startup configuration for the TUI.
+type Options struct {
+	InitialQuery string
+	InitialTag   string
+}
+
+// Start opens the Bubble Tea program with default options.
 func Start(entries []index.Entry) error {
+	return StartWithOptions(entries, Options{})
+}
+
+// StartWithOptions opens the Bubble Tea program and, once it closes, runs the built
+// command if the user chose to execute it.
+func StartWithOptions(entries []index.Entry, opts Options) error {
 	si := textinput.New()
 	si.Prompt = "⌕  "
-	si.Placeholder = "Search commands…"
+	si.Placeholder = "Search commands or #tag…"
 	si.PromptStyle = lipgloss.NewStyle().Foreground(cBrand)
 	si.PlaceholderStyle = styleDim
 	si.TextStyle = lipgloss.NewStyle().Foreground(cText)
 	si.Cursor.Style = lipgloss.NewStyle().Foreground(cBrand)
 	si.Focus()
 
+	initQ := opts.InitialQuery
+	if opts.InitialTag != "" {
+		initQ = "#" + opts.InitialTag
+	}
+	if initQ != "" {
+		si.SetValue(initQ)
+	}
+
 	m := model{
 		all:         entries,
 		searchInput: si,
 		state:       viewList,
 	}
-	m.applySearch("")
+	m.applySearch(initQ)
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	go func() {
@@ -164,6 +206,7 @@ func Start(entries []index.Entry) error {
 		return nil
 	}
 	if fm.pendingAction == "execute" && fm.builtCmd != "" {
+		_ = history.Record(fm.builtCmd)
 		return executor.Run(fm.builtCmd)
 	}
 	return nil
@@ -186,6 +229,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for i := range m.inputs {
 			m.inputs[i].Width = max(10, m.width-14)
 		}
+		m.flagFilter.Width = max(10, m.width-14)
 		if m.resultInput.Value() != "" {
 			m.resultInput.Width = max(10, m.width-14)
 		}
@@ -197,6 +241,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scanTotal = msg.Total
 		m.scanName = msg.Name
 		m.scanActive = !msg.Done && msg.Total > 0
+		return m, nil
+
+	case flagsLoadedMsg:
+		cmdLookup := m.selected.Command.Template
+		if cmdLookup == "" {
+			cmdLookup = m.selected.Command.Name
+		}
+		if m.state == viewForm && msg.cmdKey == cmdLookup {
+			m.availableFlags = msg.flags
+			m.flagsLoading = false
+			if len(m.inputs) == 0 && len(m.availableFlags) > 0 {
+				m.formSection = 1
+				m.flagFilter.Focus()
+			}
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -230,13 +289,31 @@ func (m model) View() string {
 // ---------------------------------------------------------------------------
 
 func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+	if m.showHelp {
+		switch msg.String() {
+		case "esc", "q", "?", "f1":
+			m.showHelp = false
+			return m, nil
+		}
+		return m, nil
+	}
+
+	key := msg.String()
+	switch key {
 	case "ctrl+c":
 		return m, tea.Quit
 
+	case "?":
+		if m.searchInput.Value() == "" {
+			m.showHelp = true
+			return m, nil
+		}
+
+	case "f1":
+		m.showHelp = true
+		return m, nil
+
 	case "q":
-		// Honour the "q quits" hint while the search box is empty; once the
-		// user is typing a query, q is just another character.
 		if m.searchInput.Value() == "" {
 			return m, tea.Quit
 		}
@@ -245,6 +322,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.searchInput.Value() != "" {
 			m.searchInput.SetValue("")
 			m.applySearch("")
+			m.statusMsg = ""
 			return m, nil
 		}
 		return m, tea.Quit
@@ -257,9 +335,46 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.moveCursor(1)
 		return m, nil
 
+	case "ctrl+r":
+		if len(m.flat) > 0 {
+			e := m.flat[m.cursor]
+			vals := make(map[string]string)
+			for _, a := range e.Command.Args {
+				vals[a.Name] = a.Default
+			}
+			cmd, err := executor.BuildCommand(e.Command.Template, vals)
+			if err != nil || cmd == "" {
+				cmd = e.Command.Template
+				if cmd == "" {
+					cmd = e.Command.Name
+				}
+			}
+			m.builtCmd = cmd
+			m.pendingAction = "execute"
+			return m, tea.Quit
+		}
+		return m, nil
+
+	case "ctrl+o":
+		if len(m.flat) > 0 {
+			e := m.flat[m.cursor]
+			cmd := e.Command.Template
+			if cmd == "" {
+				cmd = e.Command.Name
+			}
+			if err := executor.Copy(cmd); err != nil {
+				m.statusMsg = "✗ copy failed: " + err.Error()
+			} else {
+				m.statusMsg = "✓ copied '" + cmd + "' to clipboard"
+			}
+			return m, nil
+		}
+		return m, nil
+
 	case "enter":
 		if len(m.flat) > 0 {
-			m.openForm(m.flat[m.cursor])
+			cmd := m.openForm(m.flat[m.cursor])
+			return m, cmd
 		}
 		return m, nil
 	}
@@ -269,6 +384,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.searchInput, cmd = m.searchInput.Update(msg)
 	if m.searchInput.Value() != prev {
+		m.statusMsg = ""
 		m.applySearch(m.searchInput.Value())
 	}
 	return m, cmd
@@ -280,6 +396,39 @@ func (m *model) applySearch(query string) {
 	m.lastQuery = query
 	results := search.Query(m.all, query)
 	m.groups = buildGroups(results)
+
+	if query == "" {
+		recentList := history.Recent()
+		if len(recentList) > 0 {
+			var recentEntries []index.Entry
+			seen := make(map[string]bool)
+			for _, rcmd := range recentList {
+				for _, e := range m.all {
+					key := e.Command.Template
+					if key == "" {
+						key = e.Command.Name
+					}
+					if (key == rcmd || e.Command.Name == rcmd || strings.HasPrefix(rcmd, key)) && !seen[key] {
+						recentEntries = append(recentEntries, index.Entry{
+							Group: config.Group{
+								Name:        "recent",
+								Description: "recently used commands",
+							},
+							Command: e.Command,
+						})
+						seen[key] = true
+						break
+					}
+				}
+				if len(recentEntries) >= 5 {
+					break
+				}
+			}
+			if len(recentEntries) > 0 {
+				m.groups = append([]group{{name: "recent", entries: recentEntries}}, m.groups...)
+			}
+		}
+	}
 
 	m.flat = m.flat[:0]
 	for _, g := range m.groups {
@@ -300,16 +449,16 @@ func (m *model) applySearch(query string) {
 	m.clampOffset()
 }
 
-// buildGroups buckets entries by plugin, ordering groups by the plugin's first
+// buildGroups buckets entries by category/group, ordering groups by their first
 // appearance in the (already ranked) results so grouping survives filtering.
 func buildGroups(results []index.Entry) []group {
 	var groups []group
 	idx := make(map[string]int, len(results))
 	for _, e := range results {
-		name := e.Plugin.Name
+		name := e.Group.Name
 		gi, ok := idx[name]
 		if !ok {
-			groups = append(groups, group{plugin: name})
+			groups = append(groups, group{name: name})
 			gi = len(groups) - 1
 			idx[name] = gi
 		}
@@ -333,6 +482,15 @@ func (m *model) moveCursor(delta int) {
 }
 
 func (m model) viewList() string {
+	if m.showHelp {
+		var b strings.Builder
+		b.WriteString("\n" + m.topBar(cwdLabel()) + "\n\n")
+		b.WriteString(m.logoIcon() + "\n\n")
+		b.WriteString(m.viewHelpModal() + "\n\n")
+		b.WriteString(renderHints([]keyHint{{"esc / ? / q", "close help"}}))
+		return b.String()
+	}
+
 	var b strings.Builder
 	b.WriteString("\n" + m.topBar(cwdLabel()) + "\n\n")
 	b.WriteString(m.logoIcon() + "\n\n")
@@ -357,10 +515,67 @@ func (m model) viewList() string {
 		b.WriteString("\n  " + styleDim.Render(label) + "\n")
 	}
 
+	if m.statusMsg != "" {
+		b.WriteString("\n  " + styleOk.Render(m.statusMsg) + "\n")
+	}
+
 	b.WriteString("\n" + renderHints([]keyHint{
-		{"↑/↓", "navigate"}, {"enter", "select"}, {"esc", "clear"}, {"q", "quit"},
+		{"↑/↓", "navigate"}, {"enter", "select"}, {"ctrl+r", "quick run"}, {"ctrl+o", "copy"}, {"?", "help"}, {"q", "quit"},
 	}))
 	return b.String()
+}
+
+func (m model) viewHelpModal() string {
+	boxWidth := min(m.w()-6, 68)
+	helpStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(cBrand).
+		Padding(1, 2).
+		MarginLeft(2).
+		Width(boxWidth)
+
+	var h strings.Builder
+	h.WriteString(styleSelName.Render("PALET SHORTCUTS & HELP") + "\n\n")
+
+	type section struct {
+		title string
+		keys  []keyHint
+	}
+
+	sections := []section{
+		{
+			title: "Search & Navigation",
+			keys: []keyHint{
+				{"↑/↓, ctrl+p/n", "Navigate commands / flags"},
+				{"enter", "Open command or execute"},
+				{"ctrl+r", "Quick run (run immediately with defaults)"},
+				{"ctrl+o", "Copy command to clipboard"},
+				{"#tag", "Filter by tag (e.g. #docker, #service)"},
+				{"esc", "Clear search or go back"},
+			},
+		},
+		{
+			title: "Arguments & Flags Form",
+			keys: []keyHint{
+				{"tab", "Next field / switch to flags"},
+				{"shift+tab", "Previous field"},
+				{"ctrl+n / ctrl+p", "Cycle options for choices / enums"},
+				{"space", "Toggle flag [✓] / [ ] or bool"},
+				{"enter", "Execute command with selected flags"},
+			},
+		},
+	}
+
+	for _, s := range sections {
+		h.WriteString(styleGroupName.Render(s.title) + "\n")
+		for _, k := range s.keys {
+			h.WriteString("  " + styleKeyCap.Render(k.key) + "  " + styleKeyLbl.Render(k.label) + "\n")
+		}
+		h.WriteString("\n")
+	}
+
+	h.WriteString(styleDim.Render("Press 'esc', '?', or 'q' to close this guide."))
+	return helpStyle.Render(h.String())
 }
 
 // searchView wraps the search input in a rounded, accent-bordered field.
@@ -383,7 +598,7 @@ func (m model) listRows() (rows []string, cursorRow int) {
 			rows = append(rows, "")
 		}
 		header := "  " + styleGroupBar.Render("▎") + " " +
-			styleGroupName.Render(strings.ToUpper(g.plugin)) + "  " +
+			styleGroupName.Render(strings.ToUpper(g.name)) + "  " +
 			styleCount.Render(fmt.Sprintf("%d", len(g.entries)))
 		rows = append(rows, header)
 		for _, e := range g.entries {
@@ -401,16 +616,29 @@ func (m model) listRows() (rows []string, cursorRow int) {
 func (m model) renderEntry(e index.Entry, selected bool) string {
 	const nameW = 16
 	name := e.Command.Name
-	if e.Plugin.Description == "system command" && e.Command.Name != e.Plugin.Name {
-		name = e.Plugin.Name + " " + e.Command.Name
+	if e.Group.Description == "system command" && e.Command.Name != e.Group.Name {
+		name = e.Group.Name + " " + e.Command.Name
 	}
 	name = pad(name, nameW)
 	desc := e.Command.Description
+
+	tags := e.AllTags()
+	var tagStr string
+	if len(tags) > 0 {
+		var tagPills []string
+		for _, t := range tags {
+			tagPills = append(tagPills, "#"+t)
+		}
+		tagStr = strings.Join(tagPills, " ")
+	}
 
 	if selected {
 		inner := styleSelName.Background(cSelBg).Render(" " + name)
 		if desc != "" {
 			inner += lipgloss.NewStyle().Foreground(cSubtle).Background(cSelBg).Render("  " + desc)
+		}
+		if tagStr != "" {
+			inner += lipgloss.NewStyle().Foreground(cBrand2).Background(cSelBg).Render("  " + tagStr)
 		}
 		row := lipgloss.NewStyle().Background(cSelBg).Width(max(4, m.w()-5)).Render(inner)
 		return styleSelBar.Render("▌") + row
@@ -419,6 +647,9 @@ func (m model) renderEntry(e index.Entry, selected bool) string {
 	line := "   " + styleCmd.Render(name)
 	if desc != "" {
 		line += "  " + styleDesc.Render(desc)
+	}
+	if tagStr != "" {
+		line += "  " + styleTag.Render(tagStr)
 	}
 	return line
 }
@@ -485,7 +716,7 @@ func (m model) windowBounds(total int) (top, bottom int) {
 // Form view
 // ---------------------------------------------------------------------------
 
-func (m *model) openForm(e index.Entry) {
+func (m *model) openForm(e index.Entry) tea.Cmd {
 	m.selected = e
 	m.formErr = ""
 	m.focus = 0
@@ -506,10 +737,52 @@ func (m *model) openForm(e index.Entry) {
 		}
 		m.inputs[i] = ti
 	}
+
+	cmdLookup := e.Command.Template
+	if cmdLookup == "" {
+		cmdLookup = e.Command.Name
+	}
+
+	var cmd tea.Cmd
+	m.flagsLoading = false
+	m.availableFlags = e.Command.Flags
+	if len(m.availableFlags) == 0 {
+		if cached, ok := index.GetCachedCommandFlags(cmdLookup); ok {
+			m.availableFlags = cached
+		} else {
+			m.flagsLoading = true
+			cmd = loadFlagsCmd(cmdLookup)
+		}
+	}
+	m.selectedFlags = make(map[string]bool)
+	m.flagCursor = 0
+
+	fi := textinput.New()
+	fi.Prompt = "⚑  "
+	fi.Placeholder = "Filter flags (e.g. -d, build)… [Space to toggle]"
+	fi.PromptStyle = lipgloss.NewStyle().Foreground(cBrand)
+	fi.PlaceholderStyle = styleDim
+	fi.TextStyle = lipgloss.NewStyle().Foreground(cText)
+	fi.Cursor.Style = lipgloss.NewStyle().Foreground(cBrand)
+	fi.Width = max(10, m.w()-14)
+	m.flagFilter = fi
+
+	if len(m.inputs) == 0 && len(m.availableFlags) > 0 {
+		m.formSection = 1
+		m.flagFilter.Focus()
+	} else {
+		m.formSection = 0
+		if len(m.inputs) > 0 {
+			m.inputs[0].Focus()
+		}
+		m.flagFilter.Blur()
+	}
+
 	m.state = viewForm
+	return cmd
 }
 
-func placeholderFor(arg plugin.Arg) string {
+func placeholderFor(arg config.Arg) string {
 	if len(arg.Choices) > 0 {
 		return strings.Join(arg.Choices, " | ")
 	}
@@ -519,8 +792,51 @@ func placeholderFor(arg plugin.Arg) string {
 	return arg.Name
 }
 
+func (m model) filteredFlags() []config.Flag {
+	q := strings.ToLower(strings.TrimSpace(m.flagFilter.Value()))
+	if q == "" {
+		return m.availableFlags
+	}
+	var out []config.Flag
+	for _, f := range m.availableFlags {
+		if strings.Contains(strings.ToLower(f.Name), q) ||
+			strings.Contains(strings.ToLower(f.Value()), q) ||
+			strings.Contains(strings.ToLower(f.Description), q) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func (m model) currentPreviewCmd() string {
+	vals := make(map[string]string, len(m.inputs))
+	for i, arg := range m.selected.Command.Args {
+		vals[arg.Name] = strings.TrimSpace(m.inputs[i].Value())
+	}
+	cmd, _ := executor.BuildCommand(m.selected.Command.Template, vals)
+	if cmd == "" {
+		cmd = m.selected.Command.Template
+		if cmd == "" {
+			cmd = m.selected.Command.Name
+		}
+	}
+
+	var activeFlags []string
+	for _, f := range m.availableFlags {
+		v := f.Value()
+		if m.selectedFlags[v] {
+			activeFlags = append(activeFlags, v)
+		}
+	}
+	if len(activeFlags) > 0 {
+		cmd += " " + strings.Join(activeFlags, " ")
+	}
+	return cmd
+}
+
 func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+	key := msg.String()
+	switch key {
 	case "ctrl+c":
 		return m, tea.Quit
 
@@ -528,29 +844,164 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.state = viewList
 		return m, nil
 
-	case "tab", "down":
-		m.focusField(m.focus + 1)
+	case "tab":
+		if m.formSection == 0 {
+			if m.focus < len(m.inputs)-1 {
+				m.focusField(m.focus + 1)
+				return m, nil
+			}
+			if len(m.availableFlags) > 0 {
+				m.formSection = 1
+				m.blurAllArgs()
+				m.flagFilter.Focus()
+				return m, nil
+			}
+		} else {
+			if len(m.inputs) > 0 {
+				m.formSection = 0
+				m.flagFilter.Blur()
+				m.focusField(0)
+				return m, nil
+			}
+		}
 		return m, nil
 
-	case "shift+tab", "up":
-		m.focusField(m.focus - 1)
+	case "shift+tab":
+		if m.formSection == 1 {
+			if len(m.inputs) > 0 {
+				m.formSection = 0
+				m.flagFilter.Blur()
+				m.focusField(len(m.inputs) - 1)
+				return m, nil
+			}
+		} else {
+			if m.focus > 0 {
+				m.focusField(m.focus - 1)
+				return m, nil
+			}
+		}
 		return m, nil
 
 	case "enter":
-		if m.focus < len(m.inputs)-1 {
+		if m.formSection == 0 && m.focus < len(m.inputs)-1 {
 			m.focusField(m.focus + 1)
 			return m, nil
 		}
 		return m.submitForm()
 	}
 
-	// Forward to the focused field.
-	if len(m.inputs) > 0 {
+	if m.formSection == 1 {
+		ff := m.filteredFlags()
+		switch key {
+		case "up":
+			if m.flagCursor > 0 {
+				m.flagCursor--
+			} else if len(m.inputs) > 0 {
+				m.formSection = 0
+				m.flagFilter.Blur()
+				m.focusField(len(m.inputs) - 1)
+			}
+			return m, nil
+
+		case "down":
+			if m.flagCursor < len(ff)-1 {
+				m.flagCursor++
+			}
+			return m, nil
+
+		case " ":
+			if len(ff) > 0 && m.flagCursor >= 0 && m.flagCursor < len(ff) {
+				val := ff[m.flagCursor].Value()
+				m.selectedFlags[val] = !m.selectedFlags[val]
+				return m, nil
+			}
+		}
+
+		prev := m.flagFilter.Value()
+		var cmd tea.Cmd
+		m.flagFilter, cmd = m.flagFilter.Update(msg)
+		if m.flagFilter.Value() != prev {
+			m.flagCursor = 0
+		}
+		return m, cmd
+	}
+
+	// Args section
+	switch key {
+	case "up":
+		m.focusField(m.focus - 1)
+		return m, nil
+
+	case "down":
+		if m.focus < len(m.inputs)-1 {
+			m.focusField(m.focus + 1)
+		} else if len(m.availableFlags) > 0 {
+			m.formSection = 1
+			m.blurAllArgs()
+			m.flagFilter.Focus()
+		}
+		return m, nil
+
+	case "ctrl+n", "ctrl+p", "ctrl+l", "ctrl+h":
+		if len(m.inputs) > 0 && m.focus >= 0 && m.focus < len(m.selected.Command.Args) {
+			arg := m.selected.Command.Args[m.focus]
+			choices := arg.Choices
+			if len(choices) == 0 && (arg.Type == "bool" || strings.ToLower(arg.Name) == "bool") {
+				choices = []string{"true", "false"}
+			}
+			if len(choices) > 0 {
+				cur := strings.TrimSpace(m.inputs[m.focus].Value())
+				idx := -1
+				for ci, c := range choices {
+					if c == cur {
+						idx = ci
+						break
+					}
+				}
+				next := 0
+				if key == "ctrl+p" || key == "ctrl+h" {
+					if idx > 0 {
+						next = idx - 1
+					} else {
+						next = len(choices) - 1
+					}
+				} else {
+					if idx >= 0 {
+						next = (idx + 1) % len(choices)
+					}
+				}
+				m.inputs[m.focus].SetValue(choices[next])
+				return m, nil
+			}
+		}
+
+	case " ":
+		if len(m.inputs) > 0 && m.focus >= 0 && m.focus < len(m.selected.Command.Args) {
+			arg := m.selected.Command.Args[m.focus]
+			if arg.Type == "bool" || strings.ToLower(arg.Name) == "bool" {
+				cur := strings.TrimSpace(m.inputs[m.focus].Value())
+				if cur == "true" {
+					m.inputs[m.focus].SetValue("false")
+				} else {
+					m.inputs[m.focus].SetValue("true")
+				}
+				return m, nil
+			}
+		}
+	}
+
+	if len(m.inputs) > 0 && m.focus >= 0 && m.focus < len(m.inputs) {
 		var cmd tea.Cmd
 		m.inputs[m.focus], cmd = m.inputs[m.focus].Update(msg)
 		return m, cmd
 	}
 	return m, nil
+}
+
+func (m *model) blurAllArgs() {
+	for i := range m.inputs {
+		m.inputs[i].Blur()
+	}
 }
 
 func (m *model) focusField(i int) {
@@ -585,6 +1036,25 @@ func (m model) submitForm() (tea.Model, tea.Cmd) {
 	}
 
 	cmd, err := executor.BuildCommand(m.selected.Command.Template, vals)
+	if err == nil {
+		if cmd == "" {
+			cmd = m.selected.Command.Template
+			if cmd == "" {
+				cmd = m.selected.Command.Name
+			}
+		}
+		var activeFlags []string
+		for _, f := range m.availableFlags {
+			v := f.Value()
+			if m.selectedFlags[v] {
+				activeFlags = append(activeFlags, v)
+			}
+		}
+		if len(activeFlags) > 0 {
+			cmd += " " + strings.Join(activeFlags, " ")
+		}
+	}
+
 	m.builtCmd = cmd
 	m.buildErr = err
 	m.resultInput = textinput.New()
@@ -609,23 +1079,25 @@ func (m model) viewForm() string {
 	b.WriteString("\n" + m.topBar(cwdLabel()) + "\n\n")
 	b.WriteString(m.logoIcon() + "\n\n")
 
-	// Breadcrumb: plugin › command, with the description underneath.
-	b.WriteString("  " + stylePlugin.Render(m.selected.Plugin.Name) +
+	// Breadcrumb: group › command, with description & tags
+	b.WriteString("  " + stylePlugin.Render(m.selected.Group.Name) +
 		styleDim.Render("  ›  ") + styleCmd.Render(cmd.Name) + "\n")
 	if cmd.Description != "" {
 		b.WriteString("  " + styleDesc.Render(cmd.Description) + "\n")
 	}
+	if tags := m.selected.AllTags(); len(tags) > 0 {
+		var tagBadges []string
+		for _, t := range tags {
+			tagBadges = append(tagBadges, badge("#"+t, cBlue, cFainter))
+		}
+		b.WriteString("  " + strings.Join(tagBadges, " ") + "\n")
+	}
 	b.WriteString("\n")
 
-	if len(cmd.Args) == 0 {
-		b.WriteString(renderHints([]keyHint{{"enter", "build"}, {"esc", "back"}}))
-		return b.String()
-	}
-
+	// Arguments section
 	for i, arg := range cmd.Args {
-		focused := i == m.focus
+		focused := m.formSection == 0 && i == m.focus
 
-		// Label row: accent bar + name + type/required badges.
 		var label string
 		if focused {
 			label = styleSelBar.Render("▌") + " " + styleSelName.Render(arg.Name)
@@ -646,7 +1118,6 @@ func (m model) viewForm() string {
 			b.WriteString("    " + styleDesc.Render(arg.Description) + "\n")
 		}
 
-		// Input field, bordered; the border lights up when focused.
 		bd := cCardBd
 		if focused {
 			bd = cBrand
@@ -662,6 +1133,95 @@ func (m model) viewForm() string {
 		if arg.Default != "" {
 			b.WriteString("    " + styleDim.Render("default: "+arg.Default) + "\n")
 		}
+
+		choices := arg.Choices
+		if len(choices) == 0 && (arg.Type == "bool" || strings.ToLower(arg.Name) == "bool") {
+			choices = []string{"true", "false"}
+		}
+		if len(choices) > 0 {
+			var choicePills []string
+			cur := strings.TrimSpace(m.inputs[i].Value())
+			for _, ch := range choices {
+				if ch == cur {
+					choicePills = append(choicePills, badge("✓ "+ch, cText, cBrand))
+				} else {
+					choicePills = append(choicePills, badge(ch, cSubtle, cFainter))
+				}
+			}
+			b.WriteString("    " + styleDim.Render("options (ctrl+n/p): ") + strings.Join(choicePills, " ") + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	// Flags & Parameters section
+	if m.flagsLoading {
+		b.WriteString("  " + styleSectionLabel.Render("PARAMETERS & FLAGS") + "\n")
+		b.WriteString("    " + styleDim.Render("⚡ discovering flags in background…") + "\n\n")
+	} else if len(m.availableFlags) > 0 {
+		flagFocused := m.formSection == 1
+		headerStyle := styleSectionLabel
+		if flagFocused {
+			headerStyle = styleSelName
+		}
+		b.WriteString("  " + headerStyle.Render("PARAMETERS & FLAGS") +
+			styleDim.Render(" (Space to toggle, ↑/↓ to navigate)") + "\n")
+
+		fbd := cCardBd
+		if flagFocused {
+			fbd = cBrand
+		}
+		fBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(fbd).
+			Padding(0, 1).
+			MarginLeft(2).
+			Width(max(10, m.w()-8)).
+			Render(m.flagFilter.View())
+		b.WriteString(fBox + "\n")
+
+		ff := m.filteredFlags()
+		if len(ff) == 0 {
+			b.WriteString("    " + styleDim.Render("no flags match filter") + "\n")
+		} else {
+			maxVisible := 6
+			startIdx := 0
+			if m.flagCursor >= maxVisible {
+				startIdx = m.flagCursor - maxVisible + 1
+			}
+			endIdx := min(len(ff), startIdx+maxVisible)
+
+			for fi := startIdx; fi < endIdx; fi++ {
+				f := ff[fi]
+				isCursor := flagFocused && fi == m.flagCursor
+				isChecked := m.selectedFlags[f.Value()]
+
+				checkMark := "[ ]"
+				checkStyle := styleDim
+				if isChecked {
+					checkMark = "[✓]"
+					checkStyle = styleOk
+				}
+
+				cursorMark := "  "
+				rowStyle := styleMuted
+				if isCursor {
+					cursorMark = styleSelBar.Render("▌ ")
+					rowStyle = styleSelName
+				}
+
+				flagLabel := rowStyle.Render(f.Name)
+				descLabel := ""
+				if f.Description != "" {
+					descLabel = "  " + styleDesc.Render(f.Description)
+				}
+
+				b.WriteString(cursorMark + checkStyle.Render(checkMark) + " " + flagLabel + descLabel + "\n")
+			}
+
+			if len(ff) > maxVisible {
+				b.WriteString("    " + styleDim.Render(fmt.Sprintf("(showing %d of %d flags)", endIdx-startIdx, len(ff))) + "\n")
+			}
+		}
 		b.WriteString("\n")
 	}
 
@@ -669,8 +1229,21 @@ func (m model) viewForm() string {
 		b.WriteString("  " + badge("!", cText, cRed) + " " + styleError.Render(m.formErr) + "\n\n")
 	}
 
+	// Live Command Preview
+	previewCmd := m.currentPreviewCmd()
+	previewBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(cCardBd).
+		Padding(0, 1).
+		MarginLeft(2).
+		Width(max(10, m.w()-8)).
+		Render(lipgloss.NewStyle().Foreground(cGreen).Render("$ ") + styleCmd.Render(previewCmd))
+
+	b.WriteString("  " + styleSectionLabel.Render("PREVIEW") + "\n")
+	b.WriteString(previewBox + "\n\n")
+
 	b.WriteString(renderHints([]keyHint{
-		{"tab/↑↓", "move"}, {"enter", "next/submit"}, {"esc", "back"},
+		{"tab", "switch section"}, {"ctrl+n/p", "cycle options"}, {"space", "toggle flag/bool"}, {"enter", "execute"}, {"esc", "back"},
 	}))
 	return b.String()
 }
@@ -772,7 +1345,9 @@ func (m model) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case viewList:
 		m.searchInput, cmd = m.searchInput.Update(msg)
 	case viewForm:
-		if len(m.inputs) > 0 {
+		if m.formSection == 1 {
+			m.flagFilter, cmd = m.flagFilter.Update(msg)
+		} else if len(m.inputs) > 0 && m.focus >= 0 && m.focus < len(m.inputs) {
 			m.inputs[m.focus], cmd = m.inputs[m.focus].Update(msg)
 		}
 	}
