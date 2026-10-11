@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Thitipong-PP/palet/internal/plugin"
+	"github.com/Thitipong-PP/palet/internal/config"
 )
 
 type pathCommand struct {
@@ -118,8 +118,8 @@ func systemEntries() []Entry {
 	}
 	start := time.Now()
 	helpCount := 0
-	plugins := make([]plugin.Plugin, 0, len(cmds)+1)
-	systemPlugin := plugin.Plugin{
+	groups := make([]config.Group, 0, len(cmds)+1)
+	systemGroup := config.Group{
 		Name:        "system",
 		Description: "commands from PATH",
 	}
@@ -159,35 +159,45 @@ func systemEntries() []Entry {
 		}
 
 		if len(subcommands) > 0 {
-			p := plugin.Plugin{
+			g := config.Group{
 				Name:        cmd.Name,
 				Description: "system command",
 			}
-			p.Commands = append(p.Commands, plugin.Command{
+			g.Commands = append(g.Commands, config.Command{
 				Name:        cmd.Name,
 				Description: "",
 				Template:    cmd.Name,
 			})
 			for _, sc := range subcommands {
-				p.Commands = append(p.Commands, plugin.Command{
+				g.Commands = append(g.Commands, config.Command{
 					Name:        sc.Name,
 					Description: sc.Description,
 					Template:    cmd.Name + " " + sc.Name,
 				})
+				// Automatically map nested docker compose subcommands
+				if cmd.Name == "docker" && sc.Name == "compose" {
+					for _, csub := range []string{"up", "down", "ps", "logs", "restart", "build", "stop"} {
+						g.Commands = append(g.Commands, config.Command{
+							Name:        "compose " + csub,
+							Description: "Docker compose " + csub,
+							Template:    "docker compose " + csub,
+						})
+					}
+				}
 			}
-			plugins = append(plugins, p)
+			groups = append(groups, g)
 			continue
 		}
 
-		systemPlugin.Commands = append(systemPlugin.Commands, plugin.Command{
+		systemGroup.Commands = append(systemGroup.Commands, config.Command{
 			Name:        cmd.Name,
 			Description: "",
 			Template:    cmd.Name,
 		})
 	}
 
-	if len(systemPlugin.Commands) > 0 {
-		plugins = append(plugins, systemPlugin)
+	if len(systemGroup.Commands) > 0 {
+		groups = append(groups, systemGroup)
 	}
 
 	for path := range cache.Commands {
@@ -205,7 +215,7 @@ func systemEntries() []Entry {
 		fmt.Fprintf(os.Stderr, "palet: systemEntries done %s\n", time.Since(startAll))
 	}
 
-	return Build(plugins)
+	return Build(groups)
 }
 
 func discoverPathCommands() []pathCommand {
@@ -331,7 +341,9 @@ func discoverHelpWithTimeout(cmd string, timeout time.Duration) ([]systemSubcomm
 
 func parseHelp(output string) ([]systemSubcommand, []string) {
 	var subcommands []systemSubcommand
+	var flags []string
 	cmdSeen := make(map[string]struct{})
+	flagSeen := make(map[string]struct{})
 
 	section := ""
 	for _, line := range strings.Split(output, "\n") {
@@ -341,9 +353,16 @@ func parseHelp(output string) ([]systemSubcommand, []string) {
 		case strings.HasSuffix(lower, "commands:") || strings.Contains(lower, "available commands") || strings.HasSuffix(lower, "subcommands:"):
 			section = "commands"
 			continue
+		case strings.HasSuffix(lower, "options:") || strings.HasSuffix(lower, "flags:") || strings.Contains(lower, "available flags") || strings.Contains(lower, "global options"):
+			section = "flags"
+			continue
 		}
 		if trim == line && strings.Contains(lower, "commands") {
 			section = "commands"
+			continue
+		}
+		if trim == line && (strings.Contains(lower, "options") || strings.Contains(lower, "flags")) {
+			section = "flags"
 			continue
 		}
 
@@ -351,6 +370,7 @@ func parseHelp(output string) ([]systemSubcommand, []string) {
 			name, desc := parseSubcommandLine(line)
 			if name != "" {
 				if _, ok := cmdSeen[name]; !ok {
+					desc = strings.TrimPrefix(desc, "- ")
 					subcommands = append(subcommands, systemSubcommand{Name: name, Description: desc})
 					cmdSeen[name] = struct{}{}
 				}
@@ -358,9 +378,86 @@ func parseHelp(output string) ([]systemSubcommand, []string) {
 			continue
 		}
 
+		if section == "flags" {
+			name, _ := parseFlagLine(line)
+			if name != "" {
+				if _, ok := flagSeen[name]; !ok {
+					flags = append(flags, line)
+					flagSeen[name] = struct{}{}
+				}
+			}
+			continue
+		}
 	}
 
-	return subcommands, nil
+	return subcommands, flags
+}
+
+var flagSplitRe = regexp.MustCompile(`\s{2,}|\t+`)
+
+func parseFlagLine(line string) (string, string) {
+	trim := strings.TrimSpace(line)
+	if !strings.HasPrefix(trim, "-") {
+		return "", ""
+	}
+	parts := flagSplitRe.Split(trim, 2)
+	if len(parts) >= 2 {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	return strings.TrimSpace(parts[0]), ""
+}
+
+var (
+	flagCacheMu sync.RWMutex
+	flagCache   = make(map[string][]config.Flag)
+)
+
+// GetCachedCommandFlags returns cached flags if already discovered.
+func GetCachedCommandFlags(commandStr string) ([]config.Flag, bool) {
+	flagCacheMu.RLock()
+	defer flagCacheMu.RUnlock()
+	flags, ok := flagCache[commandStr]
+	return flags, ok
+}
+
+// SetCachedCommandFlags stores flags into memory cache.
+func SetCachedCommandFlags(commandStr string, flags []config.Flag) {
+	flagCacheMu.Lock()
+	defer flagCacheMu.Unlock()
+	flagCache[commandStr] = flags
+}
+
+// DiscoverCommandFlags inspects a command's --help output to extract supported flags.
+func DiscoverCommandFlags(commandStr string) []config.Flag {
+	if cached, ok := GetCachedCommandFlags(commandStr); ok {
+		return cached
+	}
+
+	fields := strings.Fields(commandStr)
+	if len(fields) == 0 {
+		return nil
+	}
+	out := runHelp(fields[0], append(fields[1:], "--help")...)
+	if out == "" {
+		out = runHelp(fields[0], append(fields[1:], "-h")...)
+	}
+	if out == "" {
+		SetCachedCommandFlags(commandStr, nil)
+		return nil
+	}
+	_, flagLines := parseHelp(out)
+	var outFlags []config.Flag
+	for _, l := range flagLines {
+		name, desc := parseFlagLine(l)
+		if name != "" {
+			outFlags = append(outFlags, config.Flag{
+				Name:        name,
+				Description: desc,
+			})
+		}
+	}
+	SetCachedCommandFlags(commandStr, outFlags)
+	return outFlags
 }
 
 var subcommandLineRe = regexp.MustCompile(`^\s+([a-zA-Z0-9][a-zA-Z0-9_-]*)\s*(.*)$`)
@@ -379,7 +476,9 @@ func parseSubcommandLine(line string) (string, string) {
 
 func allowlisted(name string) bool {
 	switch name {
-	case "git", "docker", "kubectl", "npm", "pnpm", "yarn", "go", "cargo", "pip", "pip3", "brew":
+	case "git", "docker", "podman", "kubectl", "apt", "apt-get", "systemctl", "journalctl",
+		"ip", "ufw", "cargo", "go", "npm", "pnpm", "yarn", "pip", "pip3", "tar",
+		"curl", "ssh", "tmux", "systemd", "gh", "brew":
 		return true
 	default:
 		return false

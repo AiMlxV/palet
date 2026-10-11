@@ -8,13 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Thitipong-PP/palet/internal/plugin"
+	"github.com/Thitipong-PP/palet/internal/config"
 )
 
-// cachedEntry stores one plugin file's hash + parsed result.
+// cachedEntry stores one custom config file's hash + parsed result.
 type cachedEntry struct {
-	Hash   string        `json:"hash"`
-	Plugin plugin.Plugin `json:"plugin"`
+	Hash  string       `json:"hash"`
+	Group config.Group `json:"group"`
 }
 
 // cacheFile maps absolute filepath → cachedEntry.
@@ -23,47 +23,32 @@ type cacheFile struct {
 	Files map[string]cachedEntry `json:"files"`
 }
 
-// LoadCached loads plugins file-by-file, using the cached version for any
-// file whose hash hasn't changed and re-parsing only the ones that have.
+// LoadCached loads custom configs file-by-file, using the cached version for any
+// file whose hash hasn't changed, and automatically indexes all system commands.
 func LoadCached() []Entry {
 	path := cachePath()
 	cf := loadCacheFile(path)
 
-	var plugins []plugin.Plugin
+	var groups []config.Group
 	dirty := false
 
-	for _, dir := range plugin.Dirs() {
-		entries, err := os.ReadDir(dir)
+	for _, absPath := range config.Files() {
+		hash := hashFile(absPath)
+
+		// cache hit — reuse without parsing
+		if cached, ok := cf.Files[absPath]; ok && cached.Hash == hash {
+			groups = append(groups, cached.Group)
+			continue
+		}
+
+		// cache miss — parse and update cache entry
+		g, err := config.ParseFile(absPath)
 		if err != nil {
 			continue
 		}
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			ext := filepath.Ext(e.Name())
-			if ext != ".yaml" && ext != ".yml" {
-				continue
-			}
-
-			absPath := filepath.Join(dir, e.Name())
-			hash := hashFile(absPath)
-
-			// cache hit — reuse without parsing
-			if cached, ok := cf.Files[absPath]; ok && cached.Hash == hash {
-				plugins = append(plugins, cached.Plugin)
-				continue
-			}
-
-			// cache miss — parse and update cache entry
-			p, err := plugin.ParseFile(absPath)
-			if err != nil {
-				continue
-			}
-			cf.Files[absPath] = cachedEntry{Hash: hash, Plugin: p}
-			plugins = append(plugins, p)
-			dirty = true
-		}
+		cf.Files[absPath] = cachedEntry{Hash: hash, Group: g}
+		groups = append(groups, g)
+		dirty = true
 	}
 
 	// prune entries for files that no longer exist
@@ -78,11 +63,13 @@ func LoadCached() []Entry {
 		_ = writeCacheFile(path, cf) // best-effort
 	}
 
-	entries := Build(plugins)
-	if strings.EqualFold(os.Getenv("PALET_SYSTEM"), "off") {
-		return entries
+	var entries []Entry
+	// Automatically map and search all system commands
+	if !strings.EqualFold(os.Getenv("PALET_SYSTEM"), "off") {
+		entries = append(entries, systemEntries()...)
 	}
-	entries = append(entries, systemEntries()...)
+	// Append user custom commands
+	entries = append(entries, Build(groups)...)
 	return entries
 }
 

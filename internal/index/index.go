@@ -1,27 +1,44 @@
 package index
 
 import (
-	"github.com/Thitipong-PP/palet/internal/plugin"
+	"github.com/Thitipong-PP/palet/internal/config"
 )
 
 // Entry is one searchable, flat command record.
 type Entry struct {
-	Plugin  plugin.Plugin
-	Command plugin.Command
+	Group   config.Group
+	Command config.Command
 }
 
-// Build flattens a slice of plugins into a single Entry slice.
+// Build flattens a slice of groups into a single Entry slice.
 // Allocation is done once up front.
-func Build(plugins []plugin.Plugin) []Entry {
+func Build(groups []config.Group) []Entry {
 	total := 0
-	for i := range plugins {
-		total += len(plugins[i].Commands)
+	for i := range groups {
+		total += len(groups[i].Commands)
 	}
 	out := make([]Entry, 0, total)
-	for _, p := range plugins {
-		for _, c := range p.Commands {
-			out = append(out, Entry{Plugin: p, Command: c})
+	for _, g := range groups {
+		for _, c := range g.Commands {
+			out = append(out, Entry{Group: g, Command: c})
 		}
 	}
 	return out
+}
+
+// AllTags returns unique, non-empty tags from both Command and Group.
+func (e Entry) AllTags() []string {
+	seen := make(map[string]struct{})
+	var tags []string
+	for _, t := range append(e.Command.Tags, e.Group.Tags...) {
+		clean := t
+		if clean == "" {
+			continue
+		}
+		if _, ok := seen[clean]; !ok {
+			seen[clean] = struct{}{}
+			tags = append(tags, clean)
+		}
+	}
+	return tags
 }
