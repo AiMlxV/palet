@@ -46,8 +46,10 @@ var (
 	styleError    = lipgloss.NewStyle().Foreground(cRed)
 	styleOk       = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
 
-	styleSelName = lipgloss.NewStyle().Foreground(cText).Bold(true)
-	styleSelBar  = lipgloss.NewStyle().Foreground(cBrand)
+	styleSelName  = lipgloss.NewStyle().Foreground(cText).Bold(true)
+	styleSelBar   = lipgloss.NewStyle().Foreground(cBrand)
+	styleMatch    = lipgloss.NewStyle().Foreground(cBrand).Bold(true).Underline(true)
+	styleSelMatch = lipgloss.NewStyle().Foreground(cBrand).Background(cSelBg).Bold(true).Underline(true)
 
 	styleGroupBar  = lipgloss.NewStyle().Foreground(cBrand)
 	styleGroupName = lipgloss.NewStyle().Foreground(cBrand2).Bold(true)
@@ -619,8 +621,11 @@ func (m model) renderEntry(e index.Entry, selected bool) string {
 	if e.Group.Description == "system command" && e.Command.Name != e.Group.Name {
 		name = e.Group.Name + " " + e.Command.Name
 	}
-	name = pad(name, nameW)
 	desc := e.Command.Description
+
+	q := m.searchInput.Value()
+	nameIndices := search.MatchIndices(name, q)
+	descIndices := search.MatchIndices(desc, q)
 
 	tags := e.AllTags()
 	var tagStr string
@@ -633,9 +638,12 @@ func (m model) renderEntry(e index.Entry, selected bool) string {
 	}
 
 	if selected {
-		inner := styleSelName.Background(cSelBg).Render(" " + name)
+		nameRendered := highlight(name, nameIndices, styleSelName.Background(cSelBg), styleSelMatch)
+		nameRendered = pad(" "+nameRendered, nameW+1)
+		inner := nameRendered
 		if desc != "" {
-			inner += lipgloss.NewStyle().Foreground(cSubtle).Background(cSelBg).Render("  " + desc)
+			descRendered := highlight(desc, descIndices, lipgloss.NewStyle().Foreground(cSubtle).Background(cSelBg), styleSelMatch)
+			inner += "  " + descRendered
 		}
 		if tagStr != "" {
 			inner += lipgloss.NewStyle().Foreground(cBrand2).Background(cSelBg).Render("  " + tagStr)
@@ -644,14 +652,57 @@ func (m model) renderEntry(e index.Entry, selected bool) string {
 		return styleSelBar.Render("▌") + row
 	}
 
-	line := "   " + styleCmd.Render(name)
+	nameRendered := highlight(name, nameIndices, styleCmd, styleMatch)
+	nameRendered = pad(nameRendered, nameW)
+	line := "   " + nameRendered
 	if desc != "" {
-		line += "  " + styleDesc.Render(desc)
+		descRendered := highlight(desc, descIndices, styleDesc, styleMatch)
+		line += "  " + descRendered
 	}
 	if tagStr != "" {
 		line += "  " + styleTag.Render(tagStr)
 	}
 	return line
+}
+
+func highlight(text string, indices []int, baseStyle, matchStyle lipgloss.Style) string {
+	if len(indices) == 0 {
+		return baseStyle.Render(text)
+	}
+	matchMap := make(map[int]bool, len(indices))
+	for _, idx := range indices {
+		matchMap[idx] = true
+	}
+
+	runes := []rune(text)
+	var b strings.Builder
+	var curRunes []rune
+	isMatching := false
+
+	flush := func() {
+		if len(curRunes) == 0 {
+			return
+		}
+		str := string(curRunes)
+		if isMatching {
+			b.WriteString(matchStyle.Render(str))
+		} else {
+			b.WriteString(baseStyle.Render(str))
+		}
+		curRunes = curRunes[:0]
+	}
+
+	for i, r := range runes {
+		match := matchMap[i]
+		if match != isMatching {
+			flush()
+			isMatching = match
+		}
+		curRunes = append(curRunes, r)
+	}
+	flush()
+
+	return b.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,7 +1260,13 @@ func (m model) viewForm() string {
 					rowStyle = styleSelName
 				}
 
-				flagLabel := rowStyle.Render(f.Name)
+				flagQ := strings.TrimSpace(m.flagFilter.Value())
+				fIndices := search.MatchIndices(f.Name, flagQ)
+				flagMatchStyle := styleMatch
+				if isCursor {
+					flagMatchStyle = styleSelMatch
+				}
+				flagLabel := highlight(f.Name, fIndices, rowStyle, flagMatchStyle)
 				descLabel := ""
 				if f.Description != "" {
 					descLabel = "  " + styleDesc.Render(f.Description)

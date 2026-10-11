@@ -108,21 +108,29 @@ func TestEmptyQuery(t *testing.T) {
 	}
 }
 
-func BenchmarkQuery(b *testing.B) {
-	// Generate 2000 simulated entries
-	entries := make([]index.Entry, 2000)
-	for i := 0; i < 2000; i++ {
-		entries[i] = index.Entry{
-			Group: config.Group{Name: "group"},
-			Command: config.Command{
-				Name:        "command",
-				Description: "some description",
-			},
-		}
+func TestMatchIndices(t *testing.T) {
+	tests := []struct {
+		name    string
+		text    string
+		query   string
+		wantLen int
+	}{
+		{"exact match", "docker compose up", "compose", 7},
+		{"prefix match", "systemctl restart", "sys", 3},
+		{"tag prefix match", "systemctl restart", "#sys", 3},
+		{"multi-word match", "git checkout -b", "git check", 9},
+		{"fuzzy match", "docker compose", "dco", 3},
+		{"empty query", "docker compose", "", 0},
+		{"no match", "docker compose", "xyz", 0},
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = Query(entries, "com")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MatchIndices(tt.text, tt.query)
+			if len(got) != tt.wantLen {
+				t.Errorf("MatchIndices(%q, %q) got %v (len %d), want len %d", tt.text, tt.query, got, len(got), tt.wantLen)
+			}
+		})
 	}
 }
 

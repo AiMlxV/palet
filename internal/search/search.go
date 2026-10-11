@@ -278,3 +278,92 @@ func wordStartsWith(s string, token string) bool {
 	}
 	return false
 }
+
+// MatchIndices returns the 0-based rune indices in text that match query.
+// It handles tag queries, exact substrings, multi-word tokens, and fuzzy subsequences.
+func MatchIndices(text, query string) []int {
+	if text == "" || query == "" {
+		return nil
+	}
+	raw := strings.TrimSpace(query)
+	switch {
+	case strings.HasPrefix(raw, "#"):
+		raw = strings.TrimPrefix(raw, "#")
+	case strings.HasPrefix(strings.ToLower(raw), "tag:"):
+		raw = strings.TrimPrefix(raw, "tag:")
+	case strings.HasPrefix(strings.ToLower(raw), "--tag "):
+		raw = strings.TrimPrefix(raw, "--tag ")
+	case strings.HasPrefix(strings.ToLower(raw), "-t "):
+		raw = strings.TrimPrefix(raw, "-t ")
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	lowerText := []rune(strings.ToLower(text))
+	lowerQuery := []rune(strings.ToLower(raw))
+
+	// 1. Exact substring match
+	strText := string(lowerText)
+	strQuery := string(lowerQuery)
+	if idx := strings.Index(strText, strQuery); idx >= 0 {
+		runeStart := len([]rune(strText[:idx]))
+		indices := make([]int, len(lowerQuery))
+		for i := range indices {
+			indices[i] = runeStart + i
+		}
+		return indices
+	}
+
+	// 2. Multi-word tokens match
+	tokens := strings.Fields(strQuery)
+	if len(tokens) > 1 {
+		seen := make(map[int]bool)
+		var indices []int
+		for _, tok := range tokens {
+			tokRunes := []rune(tok)
+			subStr := strText
+			offset := 0
+			for {
+				pos := strings.Index(subStr, tok)
+				if pos < 0 {
+					break
+				}
+				runeOffset := len([]rune(strText[:offset+pos]))
+				for i := 0; i < len(tokRunes); i++ {
+					ri := runeOffset + i
+					if !seen[ri] {
+						seen[ri] = true
+						indices = append(indices, ri)
+					}
+				}
+				next := pos + len(tok)
+				if next >= len(subStr) {
+					break
+				}
+				subStr = subStr[next:]
+				offset += next
+			}
+		}
+		if len(indices) > 0 {
+			sort.Ints(indices)
+			return indices
+		}
+	}
+
+	// 3. Smart fuzzy match
+	qi := 0
+	indices := make([]int, 0, len(lowerQuery))
+	for ti := 0; ti < len(lowerText) && qi < len(lowerQuery); ti++ {
+		if lowerText[ti] == lowerQuery[qi] {
+			indices = append(indices, ti)
+			qi++
+		}
+	}
+	if qi == len(lowerQuery) {
+		return indices
+	}
+
+	return nil
+}
