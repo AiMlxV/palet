@@ -108,21 +108,50 @@ func TestEmptyQuery(t *testing.T) {
 	}
 }
 
-func BenchmarkQuery(b *testing.B) {
-	// Generate 2000 simulated entries
-	entries := make([]index.Entry, 2000)
-	for i := 0; i < 2000; i++ {
-		entries[i] = index.Entry{
-			Group: config.Group{Name: "group"},
-			Command: config.Command{
-				Name:        "command",
-				Description: "some description",
-			},
-		}
+func TestQueryWithContext(t *testing.T) {
+	entries := sampleEntries()
+
+	// 1. Empty query with suggestions should promote tar to the top
+	suggs := []string{"tar extract"}
+	promoted := QueryWithContext(entries, "", suggs)
+	if len(promoted) != len(entries) {
+		t.Fatalf("expected %d entries, got %d", len(entries), len(promoted))
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = Query(entries, "com")
+	if promoted[0].Group.Name != "tar" {
+		t.Errorf("expected promoted[0] to be tar, got %s", promoted[0].Group.Name)
+	}
+
+	// 2. Query search with context boost
+	// Query "tar" matches tar extract (group tar) and systemctl restart (contains "tar" in restart)
+	boosted := QueryWithContext(entries, "tar", []string{"tar extract"})
+	if len(boosted) == 0 || boosted[0].Group.Name != "tar" {
+		t.Errorf("expected tar to be boosted to top for 'tar', got %v", boosted)
+	}
+}
+
+func TestMatchIndices(t *testing.T) {
+	tests := []struct {
+		name    string
+		text    string
+		query   string
+		wantLen int
+	}{
+		{"exact match", "docker compose up", "compose", 7},
+		{"prefix match", "systemctl restart", "sys", 3},
+		{"tag prefix match", "systemctl restart", "#sys", 3},
+		{"multi-word match", "git checkout -b", "git check", 9},
+		{"fuzzy match", "docker compose", "dco", 3},
+		{"empty query", "docker compose", "", 0},
+		{"no match", "docker compose", "xyz", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MatchIndices(tt.text, tt.query)
+			if len(got) != tt.wantLen {
+				t.Errorf("MatchIndices(%q, %q) got %v (len %d), want len %d", tt.text, tt.query, got, len(got), tt.wantLen)
+			}
+		})
 	}
 }
 

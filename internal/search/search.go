@@ -23,8 +23,44 @@ const (
 // Query returns entries matching query, ranked by relevance.
 // An empty query returns all entries unchanged.
 func Query(entries []index.Entry, query string) []index.Entry {
+	return QueryWithContext(entries, query, nil)
+}
+
+// QueryWithContext returns entries matching query, boosted by project suggestions.
+func QueryWithContext(entries []index.Entry, query string, suggestions []string) []index.Entry {
 	if query == "" {
-		return entries
+		if len(suggestions) == 0 {
+			return entries
+		}
+		// Promote context suggestions to the top
+		var top []index.Entry
+		seen := make(map[string]struct{})
+		for _, sugg := range suggestions {
+			suggNorm := normalize(sugg)
+			for _, e := range entries {
+				key := e.Group.Name + "/" + e.Command.Name
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				if matchesSuggestion(e, suggNorm) {
+					top = append(top, e)
+					seen[key] = struct{}{}
+					break
+				}
+			}
+		}
+		if len(top) == 0 {
+			return entries
+		}
+		out := make([]index.Entry, 0, len(entries))
+		out = append(out, top...)
+		for _, e := range entries {
+			key := e.Group.Name + "/" + e.Command.Name
+			if _, ok := seen[key]; !ok {
+				out = append(out, e)
+			}
+		}
+		return out
 	}
 
 	raw := strings.TrimSpace(query)
@@ -64,6 +100,13 @@ func Query(entries []index.Entry, query string) []index.Entry {
 		q := normalize(query)
 		for _, e := range entries {
 			if s := score(e, q); s > 0 {
+				// Bonus if entry matches current project context
+				for _, sugg := range suggestions {
+					if matchesSuggestion(e, normalize(sugg)) {
+						s += 25
+						break
+					}
+				}
 				hits = append(hits, hit{e, s})
 			}
 		}
@@ -78,6 +121,21 @@ func Query(entries []index.Entry, query string) []index.Entry {
 		out[i] = h.entry
 	}
 	return out
+}
+
+func matchesSuggestion(e index.Entry, suggNorm string) bool {
+	cmdName := normalize(e.Command.Name)
+	grpName := normalize(e.Group.Name)
+	tmpl := normalize(e.Command.Template)
+	combined := grpName + " " + cmdName
+
+	if cmdName == suggNorm || combined == suggNorm || tmpl == suggNorm {
+		return true
+	}
+	if strings.HasPrefix(cmdName, suggNorm) || strings.HasPrefix(combined, suggNorm) || strings.HasPrefix(tmpl, suggNorm) {
+		return true
+	}
+	return false
 }
 
 func scoreExplicitTag(e index.Entry, tagQuery string) int {
@@ -277,4 +335,93 @@ func wordStartsWith(s string, token string) bool {
 		}
 	}
 	return false
+}
+
+// MatchIndices returns the 0-based rune indices in text that match query.
+// It handles tag queries, exact substrings, multi-word tokens, and fuzzy subsequences.
+func MatchIndices(text, query string) []int {
+	if text == "" || query == "" {
+		return nil
+	}
+	raw := strings.TrimSpace(query)
+	switch {
+	case strings.HasPrefix(raw, "#"):
+		raw = strings.TrimPrefix(raw, "#")
+	case strings.HasPrefix(strings.ToLower(raw), "tag:"):
+		raw = strings.TrimPrefix(raw, "tag:")
+	case strings.HasPrefix(strings.ToLower(raw), "--tag "):
+		raw = strings.TrimPrefix(raw, "--tag ")
+	case strings.HasPrefix(strings.ToLower(raw), "-t "):
+		raw = strings.TrimPrefix(raw, "-t ")
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	lowerText := []rune(strings.ToLower(text))
+	lowerQuery := []rune(strings.ToLower(raw))
+
+	// 1. Exact substring match
+	strText := string(lowerText)
+	strQuery := string(lowerQuery)
+	if idx := strings.Index(strText, strQuery); idx >= 0 {
+		runeStart := len([]rune(strText[:idx]))
+		indices := make([]int, len(lowerQuery))
+		for i := range indices {
+			indices[i] = runeStart + i
+		}
+		return indices
+	}
+
+	// 2. Multi-word tokens match
+	tokens := strings.Fields(strQuery)
+	if len(tokens) > 1 {
+		seen := make(map[int]bool)
+		var indices []int
+		for _, tok := range tokens {
+			tokRunes := []rune(tok)
+			subStr := strText
+			offset := 0
+			for {
+				pos := strings.Index(subStr, tok)
+				if pos < 0 {
+					break
+				}
+				runeOffset := len([]rune(strText[:offset+pos]))
+				for i := 0; i < len(tokRunes); i++ {
+					ri := runeOffset + i
+					if !seen[ri] {
+						seen[ri] = true
+						indices = append(indices, ri)
+					}
+				}
+				next := pos + len(tok)
+				if next >= len(subStr) {
+					break
+				}
+				subStr = subStr[next:]
+				offset += next
+			}
+		}
+		if len(indices) > 0 {
+			sort.Ints(indices)
+			return indices
+		}
+	}
+
+	// 3. Smart fuzzy match
+	qi := 0
+	indices := make([]int, 0, len(lowerQuery))
+	for ti := 0; ti < len(lowerText) && qi < len(lowerQuery); ti++ {
+		if lowerText[ti] == lowerQuery[qi] {
+			indices = append(indices, ti)
+			qi++
+		}
+	}
+	if qi == len(lowerQuery) {
+		return indices
+	}
+
+	return nil
 }

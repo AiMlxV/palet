@@ -10,10 +10,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Thitipong-PP/palet/internal/completion"
 	"github.com/Thitipong-PP/palet/internal/config"
 	"github.com/Thitipong-PP/palet/internal/executor"
 	"github.com/Thitipong-PP/palet/internal/history"
 	"github.com/Thitipong-PP/palet/internal/index"
+	"github.com/Thitipong-PP/palet/internal/project"
 	"github.com/Thitipong-PP/palet/internal/search"
 	"github.com/Thitipong-PP/palet/internal/validator"
 )
@@ -46,8 +48,12 @@ var (
 	styleError    = lipgloss.NewStyle().Foreground(cRed)
 	styleOk       = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
 
-	styleSelName = lipgloss.NewStyle().Foreground(cText).Bold(true)
-	styleSelBar  = lipgloss.NewStyle().Foreground(cBrand)
+	cHighlight = lipgloss.Color("#ffb86c") // high-contrast gold/amber for search highlights
+
+	styleSelName  = lipgloss.NewStyle().Foreground(cText).Bold(true)
+	styleSelBar   = lipgloss.NewStyle().Foreground(cBrand)
+	styleMatch    = lipgloss.NewStyle().Foreground(cHighlight).Bold(true)
+	styleSelMatch = lipgloss.NewStyle().Foreground(cHighlight).Background(cSelBg).Bold(true)
 
 	styleGroupBar  = lipgloss.NewStyle().Foreground(cBrand)
 	styleGroupName = lipgloss.NewStyle().Foreground(cBrand2).Bold(true)
@@ -92,9 +98,10 @@ type group struct {
 }
 
 type model struct {
-	all    []index.Entry // immutable full command set
-	groups []group       // current filtered results, grouped by category
-	flat   []index.Entry // filtered results flattened in display order
+	all         []index.Entry // immutable full command set
+	groups      []group       // current filtered results, grouped by category
+	flat        []index.Entry // filtered results flattened in display order
+	projectInfo project.Info  // detected project context
 
 	state viewState
 
@@ -117,6 +124,11 @@ type model struct {
 	selectedFlags  map[string]bool
 	flagCursor     int
 	formSection    int // 0: args inputs, 1: flags section
+
+	// path autocompletion
+	pathCandidates       []string
+	pathCandidateIdx     int
+	pathCandidateLastVal string
 
 	// result view
 	builtCmd    string
@@ -180,8 +192,10 @@ func StartWithOptions(entries []index.Entry, opts Options) error {
 		si.SetValue(initQ)
 	}
 
+	projInfo := project.Detect("")
 	m := model{
 		all:         entries,
+		projectInfo: projInfo,
 		searchInput: si,
 		state:       viewList,
 	}
@@ -337,20 +351,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "ctrl+r":
 		if len(m.flat) > 0 {
-			e := m.flat[m.cursor]
-			vals := make(map[string]string)
-			for _, a := range e.Command.Args {
-				vals[a.Name] = a.Default
-			}
-			cmd, err := executor.BuildCommand(e.Command.Template, vals)
-			if err != nil || cmd == "" {
-				cmd = e.Command.Template
-				if cmd == "" {
-					cmd = e.Command.Name
-				}
-			}
-			m.builtCmd = cmd
-			m.pendingAction = "execute"
+			m.executeDirectly(m.flat[m.cursor])
 			return m, tea.Quit
 		}
 		return m, nil
@@ -373,8 +374,20 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "enter":
 		if len(m.flat) > 0 {
-			cmd := m.openForm(m.flat[m.cursor])
-			return m, cmd
+			e := m.flat[m.cursor]
+			// 1-Tap Instant Execution if command has no required arguments
+			if !hasRequiredArgs(e.Command) {
+				m.executeDirectly(e)
+				return m, tea.Quit
+			}
+			return m, m.openForm(e)
+		}
+		return m, nil
+
+	case "tab", "right":
+		// Tab or Right Arrow opens form to customize flags or targets
+		if len(m.flat) > 0 {
+			return m, m.openForm(m.flat[m.cursor])
 		}
 		return m, nil
 	}
@@ -390,14 +403,81 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *model) executeDirectly(e index.Entry) {
+	vals := make(map[string]string)
+	for _, a := range e.Command.Args {
+		vals[a.Name] = a.Default
+	}
+	cmd, err := executor.BuildCommand(e.Command.Template, vals)
+	if err != nil || cmd == "" {
+		cmd = e.Command.Template
+		if cmd == "" {
+			cmd = e.Command.Name
+		}
+	}
+	_ = history.Record(cmd)
+	m.builtCmd = cmd
+	m.pendingAction = "execute"
+}
+
+func hasRequiredArgs(cmd config.Command) bool {
+	for _, a := range cmd.Args {
+		if a.Required {
+			return true
+		}
+	}
+	return false
+}
+
 // applySearch refilters the entries and rebuilds the grouped + flat views.
 func (m *model) applySearch(query string) {
 	changed := query != m.lastQuery
 	m.lastQuery = query
-	results := search.Query(m.all, query)
+	results := search.QueryWithContext(m.all, query, m.projectInfo.Suggestions)
 	m.groups = buildGroups(results)
 
 	if query == "" {
+		// 1. Context Suggestions (top priority)
+		if len(m.projectInfo.Suggestions) > 0 {
+			var suggEntries []index.Entry
+			seenSugg := make(map[string]bool)
+			for _, sugg := range m.projectInfo.Suggestions {
+				suggLower := strings.ToLower(sugg)
+				for _, e := range m.all {
+					fullName := strings.ToLower(e.Group.Name + " " + e.Command.Name)
+					cmdName := strings.ToLower(e.Command.Name)
+					tmpl := strings.ToLower(e.Command.Template)
+					if (fullName == suggLower || cmdName == suggLower || tmpl == suggLower || strings.HasPrefix(fullName, suggLower) || strings.HasPrefix(cmdName, suggLower)) && !seenSugg[fullName] {
+						cmdCopy := e.Command
+						displayName := e.Command.Name
+						if e.Group.Name != "" && e.Group.Name != "system" && !strings.HasPrefix(e.Command.Name, e.Group.Name) {
+							displayName = e.Group.Name + " " + e.Command.Name
+						} else if e.Command.Template != "" && !strings.Contains(e.Command.Template, "{{") {
+							displayName = e.Command.Template
+						}
+						cmdCopy.Name = displayName
+
+						suggEntries = append(suggEntries, index.Entry{
+							Group: config.Group{
+								Name:        "suggested",
+								Description: "recommended for current project",
+							},
+							Command: cmdCopy,
+						})
+						seenSugg[fullName] = true
+						break
+					}
+				}
+				if len(suggEntries) >= 6 {
+					break
+				}
+			}
+			if len(suggEntries) > 0 {
+				m.groups = append([]group{{name: "suggested for project", entries: suggEntries}}, m.groups...)
+			}
+		}
+
+		// 2. Recent commands
 		recentList := history.Recent()
 		if len(recentList) > 0 {
 			var recentEntries []index.Entry
@@ -409,12 +489,21 @@ func (m *model) applySearch(query string) {
 						key = e.Command.Name
 					}
 					if (key == rcmd || e.Command.Name == rcmd || strings.HasPrefix(rcmd, key)) && !seen[key] {
+						cmdCopy := e.Command
+						displayName := e.Command.Name
+						if e.Group.Name != "" && e.Group.Name != "system" && !strings.HasPrefix(e.Command.Name, e.Group.Name) {
+							displayName = e.Group.Name + " " + e.Command.Name
+						} else if e.Command.Template != "" && !strings.Contains(e.Command.Template, "{{") {
+							displayName = e.Command.Template
+						}
+						cmdCopy.Name = displayName
+
 						recentEntries = append(recentEntries, index.Entry{
 							Group: config.Group{
 								Name:        "recent",
 								Description: "recently used commands",
 							},
-							Command: e.Command,
+							Command: cmdCopy,
 						})
 						seen[key] = true
 						break
@@ -484,7 +573,7 @@ func (m *model) moveCursor(delta int) {
 func (m model) viewList() string {
 	if m.showHelp {
 		var b strings.Builder
-		b.WriteString("\n" + m.topBar(cwdLabel()) + "\n\n")
+		b.WriteString("\n" + m.topBar(m.headerContext()) + "\n\n")
 		b.WriteString(m.logoIcon() + "\n\n")
 		b.WriteString(m.viewHelpModal() + "\n\n")
 		b.WriteString(renderHints([]keyHint{{"esc / ? / q", "close help"}}))
@@ -492,7 +581,7 @@ func (m model) viewList() string {
 	}
 
 	var b strings.Builder
-	b.WriteString("\n" + m.topBar(cwdLabel()) + "\n\n")
+	b.WriteString("\n" + m.topBar(m.headerContext()) + "\n\n")
 	b.WriteString(m.logoIcon() + "\n\n")
 	b.WriteString(m.searchView() + "\n\n")
 
@@ -520,7 +609,7 @@ func (m model) viewList() string {
 	}
 
 	b.WriteString("\n" + renderHints([]keyHint{
-		{"↑/↓", "navigate"}, {"enter", "select"}, {"ctrl+r", "quick run"}, {"ctrl+o", "copy"}, {"?", "help"}, {"q", "quit"},
+		{"↑/↓", "navigate"}, {"enter", "run"}, {"tab", "customize / flags"}, {"ctrl+o", "copy"}, {"?", "help"}, {"q", "quit"},
 	}))
 	return b.String()
 }
@@ -557,7 +646,7 @@ func (m model) viewHelpModal() string {
 		{
 			title: "Arguments & Flags Form",
 			keys: []keyHint{
-				{"tab", "Next field / switch to flags"},
+				{"tab", "Autocomplete path / next field"},
 				{"shift+tab", "Previous field"},
 				{"ctrl+n / ctrl+p", "Cycle options for choices / enums"},
 				{"space", "Toggle flag [✓] / [ ] or bool"},
@@ -614,13 +703,18 @@ func (m model) listRows() (rows []string, cursorRow int) {
 }
 
 func (m model) renderEntry(e index.Entry, selected bool) string {
-	const nameW = 16
+	const nameW = 20
 	name := e.Command.Name
-	if e.Group.Description == "system command" && e.Command.Name != e.Group.Name {
+	if e.Group.Description == "system command" &&
+		e.Command.Name != e.Group.Name &&
+		!strings.HasPrefix(e.Command.Name, e.Group.Name) {
 		name = e.Group.Name + " " + e.Command.Name
 	}
-	name = pad(name, nameW)
 	desc := e.Command.Description
+
+	q := m.searchInput.Value()
+	nameIndices := search.MatchIndices(name, q)
+	descIndices := search.MatchIndices(desc, q)
 
 	tags := e.AllTags()
 	var tagStr string
@@ -631,27 +725,76 @@ func (m model) renderEntry(e index.Entry, selected bool) string {
 		}
 		tagStr = strings.Join(tagPills, " ")
 	}
+	tagIndices := search.MatchIndices(tagStr, q)
 
 	if selected {
-		inner := styleSelName.Background(cSelBg).Render(" " + name)
+		nameRendered := highlight(name, nameIndices, styleSelName.Background(cSelBg), styleSelMatch)
+		nameRendered = pad(" "+nameRendered, nameW+1)
+		inner := nameRendered
 		if desc != "" {
-			inner += lipgloss.NewStyle().Foreground(cSubtle).Background(cSelBg).Render("  " + desc)
+			descRendered := highlight(desc, descIndices, lipgloss.NewStyle().Foreground(cSubtle).Background(cSelBg), styleSelMatch)
+			inner += "  " + descRendered
 		}
 		if tagStr != "" {
-			inner += lipgloss.NewStyle().Foreground(cBrand2).Background(cSelBg).Render("  " + tagStr)
+			tagRendered := highlight(tagStr, tagIndices, lipgloss.NewStyle().Foreground(cBrand2).Background(cSelBg), styleSelMatch)
+			inner += "  " + tagRendered
 		}
 		row := lipgloss.NewStyle().Background(cSelBg).Width(max(4, m.w()-5)).Render(inner)
 		return styleSelBar.Render("▌") + row
 	}
 
-	line := "   " + styleCmd.Render(name)
+	nameRendered := highlight(name, nameIndices, styleCmd, styleMatch)
+	nameRendered = pad(nameRendered, nameW)
+	line := "   " + nameRendered
 	if desc != "" {
-		line += "  " + styleDesc.Render(desc)
+		descRendered := highlight(desc, descIndices, styleDesc, styleMatch)
+		line += "  " + descRendered
 	}
 	if tagStr != "" {
-		line += "  " + styleTag.Render(tagStr)
+		tagRendered := highlight(tagStr, tagIndices, styleTag, styleMatch)
+		line += "  " + tagRendered
 	}
 	return line
+}
+
+func highlight(text string, indices []int, baseStyle, matchStyle lipgloss.Style) string {
+	if len(indices) == 0 {
+		return baseStyle.Render(text)
+	}
+	matchMap := make(map[int]bool, len(indices))
+	for _, idx := range indices {
+		matchMap[idx] = true
+	}
+
+	runes := []rune(text)
+	var b strings.Builder
+	var curRunes []rune
+	isMatching := false
+
+	flush := func() {
+		if len(curRunes) == 0 {
+			return
+		}
+		str := string(curRunes)
+		if isMatching {
+			b.WriteString(matchStyle.Render(str))
+		} else {
+			b.WriteString(baseStyle.Render(str))
+		}
+		curRunes = curRunes[:0]
+	}
+
+	for i, r := range runes {
+		match := matchMap[i]
+		if match != isMatching {
+			flush()
+			isMatching = match
+		}
+		curRunes = append(curRunes, r)
+	}
+	flush()
+
+	return b.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -717,6 +860,15 @@ func (m model) windowBounds(total int) (top, bottom int) {
 // ---------------------------------------------------------------------------
 
 func (m *model) openForm(e index.Entry) tea.Cmd {
+	if len(e.Command.Args) == 0 {
+		cmdLookup := e.Command.Template
+		if cmdLookup == "" {
+			cmdLookup = e.Command.Name
+		}
+		if detectedArg := completion.DetectCommandArg(cmdLookup); detectedArg != nil {
+			e.Command.Args = []config.Arg{*detectedArg}
+		}
+	}
 	m.selected = e
 	m.formErr = ""
 	m.focus = 0
@@ -831,6 +983,11 @@ func (m model) currentPreviewCmd() string {
 	if len(activeFlags) > 0 {
 		cmd += " " + strings.Join(activeFlags, " ")
 	}
+	for _, arg := range m.selected.Command.Args {
+		if val := strings.TrimSpace(vals[arg.Name]); val != "" && !strings.Contains(m.selected.Command.Template, "{{") {
+			cmd += " " + val
+		}
+	}
 	return cmd
 }
 
@@ -845,7 +1002,38 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "tab":
-		if m.formSection == 0 {
+		if m.formSection == 0 && len(m.inputs) > 0 && m.focus >= 0 && m.focus < len(m.selected.Command.Args) {
+			arg := m.selected.Command.Args[m.focus]
+			curVal := m.inputs[m.focus].Value()
+
+			// If we already have multiple candidates and user is cycling through them
+			if len(m.pathCandidates) > 1 && m.pathCandidateLastVal == curVal {
+				m.pathCandidateIdx = (m.pathCandidateIdx + 1) % len(m.pathCandidates)
+				chosen := m.pathCandidates[m.pathCandidateIdx]
+				m.inputs[m.focus].SetValue(chosen)
+				m.inputs[m.focus].SetCursor(len(chosen))
+				m.pathCandidateLastVal = chosen
+				return m, nil
+			}
+
+			res := completion.CompleteSemantic(arg.Type, curVal)
+			if len(res.Candidates) > 0 {
+				m.pathCandidates = res.Candidates
+				m.pathCandidateIdx = 0
+				target := res.CommonPrefix
+				if target == "" || target == curVal {
+					target = res.Candidates[0]
+				}
+				if target != curVal {
+					m.inputs[m.focus].SetValue(target)
+					m.inputs[m.focus].SetCursor(len(target))
+					m.pathCandidateLastVal = target
+					return m, nil
+				}
+			}
+
+			// If not a path argument or already fully completed, advance to next field
+			m.pathCandidates = nil
 			if m.focus < len(m.inputs)-1 {
 				m.focusField(m.focus + 1)
 				return m, nil
@@ -856,7 +1044,7 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.flagFilter.Focus()
 				return m, nil
 			}
-		} else {
+		} else if m.formSection == 1 {
 			if len(m.inputs) > 0 {
 				m.formSection = 0
 				m.flagFilter.Blur()
@@ -1014,6 +1202,10 @@ func (m *model) focusField(i int) {
 	if i >= len(m.inputs) {
 		i = len(m.inputs) - 1
 	}
+	m.pathCandidates = nil
+	m.pathCandidateIdx = 0
+	m.pathCandidateLastVal = ""
+
 	for j := range m.inputs {
 		if j == i {
 			m.inputs[j].Focus()
@@ -1053,6 +1245,11 @@ func (m model) submitForm() (tea.Model, tea.Cmd) {
 		if len(activeFlags) > 0 {
 			cmd += " " + strings.Join(activeFlags, " ")
 		}
+		for _, arg := range m.selected.Command.Args {
+			if val := strings.TrimSpace(vals[arg.Name]); val != "" && !strings.Contains(m.selected.Command.Template, "{{") {
+				cmd += " " + val
+			}
+		}
 	}
 
 	m.builtCmd = cmd
@@ -1076,7 +1273,7 @@ func (m model) viewForm() string {
 	var b strings.Builder
 	cmd := m.selected.Command
 
-	b.WriteString("\n" + m.topBar(cwdLabel()) + "\n\n")
+	b.WriteString("\n" + m.topBar(m.headerContext()) + "\n\n")
 	b.WriteString(m.logoIcon() + "\n\n")
 
 	// Breadcrumb: group › command, with description & tags
@@ -1129,6 +1326,23 @@ func (m model) viewForm() string {
 			MarginLeft(2).
 			Width(max(10, m.w()-8))
 		b.WriteString(box.Render(m.inputs[i].View()) + "\n")
+
+		if focused && len(m.pathCandidates) > 0 {
+			var candPills []string
+			maxShow := min(5, len(m.pathCandidates))
+			for ci := 0; ci < maxShow; ci++ {
+				cand := m.pathCandidates[ci]
+				if ci == m.pathCandidateIdx {
+					candPills = append(candPills, badge("▶ "+cand, cText, cBrand))
+				} else {
+					candPills = append(candPills, badge(cand, cSubtle, cFainter))
+				}
+			}
+			if len(m.pathCandidates) > maxShow {
+				candPills = append(candPills, styleDim.Render(fmt.Sprintf("+%d more", len(m.pathCandidates)-maxShow)))
+			}
+			b.WriteString("    " + styleDim.Render("Tab to cycle: ") + strings.Join(candPills, " ") + "\n")
+		}
 
 		if arg.Default != "" {
 			b.WriteString("    " + styleDim.Render("default: "+arg.Default) + "\n")
@@ -1209,7 +1423,13 @@ func (m model) viewForm() string {
 					rowStyle = styleSelName
 				}
 
-				flagLabel := rowStyle.Render(f.Name)
+				flagQ := strings.TrimSpace(m.flagFilter.Value())
+				fIndices := search.MatchIndices(f.Name, flagQ)
+				flagMatchStyle := styleMatch
+				if isCursor {
+					flagMatchStyle = styleSelMatch
+				}
+				flagLabel := highlight(f.Name, fIndices, rowStyle, flagMatchStyle)
 				descLabel := ""
 				if f.Description != "" {
 					descLabel = "  " + styleDesc.Render(f.Description)
@@ -1243,7 +1463,7 @@ func (m model) viewForm() string {
 	b.WriteString(previewBox + "\n\n")
 
 	b.WriteString(renderHints([]keyHint{
-		{"tab", "switch section"}, {"ctrl+n/p", "cycle options"}, {"space", "toggle flag/bool"}, {"enter", "execute"}, {"esc", "back"},
+		{"tab", "autocomplete / next"}, {"ctrl+n/p", "cycle options"}, {"space", "toggle flag/bool"}, {"enter", "execute"}, {"esc", "back"},
 	}))
 	return b.String()
 }
@@ -1439,4 +1659,16 @@ func cwdLabel() string {
 		return "~" + wd[len(home):]
 	}
 	return filepath.Clean(wd)
+}
+
+// headerContext returns the cwd and detected project summary (e.g. "~/OSS/palet-win  •  Go (palet)").
+func (m model) headerContext() string {
+	lbl := cwdLabel()
+	if m.projectInfo.Summary != "" {
+		if lbl != "" {
+			return lbl + "  •  " + m.projectInfo.Summary
+		}
+		return m.projectInfo.Summary
+	}
+	return lbl
 }
