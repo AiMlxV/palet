@@ -23,8 +23,44 @@ const (
 // Query returns entries matching query, ranked by relevance.
 // An empty query returns all entries unchanged.
 func Query(entries []index.Entry, query string) []index.Entry {
+	return QueryWithContext(entries, query, nil)
+}
+
+// QueryWithContext returns entries matching query, boosted by project suggestions.
+func QueryWithContext(entries []index.Entry, query string, suggestions []string) []index.Entry {
 	if query == "" {
-		return entries
+		if len(suggestions) == 0 {
+			return entries
+		}
+		// Promote context suggestions to the top
+		var top []index.Entry
+		seen := make(map[string]struct{})
+		for _, sugg := range suggestions {
+			suggNorm := normalize(sugg)
+			for _, e := range entries {
+				key := e.Group.Name + "/" + e.Command.Name
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				if matchesSuggestion(e, suggNorm) {
+					top = append(top, e)
+					seen[key] = struct{}{}
+					break
+				}
+			}
+		}
+		if len(top) == 0 {
+			return entries
+		}
+		out := make([]index.Entry, 0, len(entries))
+		out = append(out, top...)
+		for _, e := range entries {
+			key := e.Group.Name + "/" + e.Command.Name
+			if _, ok := seen[key]; !ok {
+				out = append(out, e)
+			}
+		}
+		return out
 	}
 
 	raw := strings.TrimSpace(query)
@@ -64,6 +100,13 @@ func Query(entries []index.Entry, query string) []index.Entry {
 		q := normalize(query)
 		for _, e := range entries {
 			if s := score(e, q); s > 0 {
+				// Bonus if entry matches current project context
+				for _, sugg := range suggestions {
+					if matchesSuggestion(e, normalize(sugg)) {
+						s += 25
+						break
+					}
+				}
 				hits = append(hits, hit{e, s})
 			}
 		}
@@ -78,6 +121,21 @@ func Query(entries []index.Entry, query string) []index.Entry {
 		out[i] = h.entry
 	}
 	return out
+}
+
+func matchesSuggestion(e index.Entry, suggNorm string) bool {
+	cmdName := normalize(e.Command.Name)
+	grpName := normalize(e.Group.Name)
+	tmpl := normalize(e.Command.Template)
+	combined := grpName + " " + cmdName
+
+	if cmdName == suggNorm || combined == suggNorm || tmpl == suggNorm {
+		return true
+	}
+	if strings.HasPrefix(cmdName, suggNorm) || strings.HasPrefix(combined, suggNorm) || strings.HasPrefix(tmpl, suggNorm) {
+		return true
+	}
+	return false
 }
 
 func scoreExplicitTag(e index.Entry, tagQuery string) int {

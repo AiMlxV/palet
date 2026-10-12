@@ -108,6 +108,27 @@ func TestEmptyQuery(t *testing.T) {
 	}
 }
 
+func TestQueryWithContext(t *testing.T) {
+	entries := sampleEntries()
+
+	// 1. Empty query with suggestions should promote tar to the top
+	suggs := []string{"tar extract"}
+	promoted := QueryWithContext(entries, "", suggs)
+	if len(promoted) != len(entries) {
+		t.Fatalf("expected %d entries, got %d", len(entries), len(promoted))
+	}
+	if promoted[0].Group.Name != "tar" {
+		t.Errorf("expected promoted[0] to be tar, got %s", promoted[0].Group.Name)
+	}
+
+	// 2. Query search with context boost
+	// Query "tar" matches tar extract (group tar) and systemctl restart (contains "tar" in restart)
+	boosted := QueryWithContext(entries, "tar", []string{"tar extract"})
+	if len(boosted) == 0 || boosted[0].Group.Name != "tar" {
+		t.Errorf("expected tar to be boosted to top for 'tar', got %v", boosted)
+	}
+}
+
 func TestMatchIndices(t *testing.T) {
 	tests := []struct {
 		name    string

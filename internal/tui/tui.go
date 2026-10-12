@@ -14,6 +14,7 @@ import (
 	"github.com/Thitipong-PP/palet/internal/executor"
 	"github.com/Thitipong-PP/palet/internal/history"
 	"github.com/Thitipong-PP/palet/internal/index"
+	"github.com/Thitipong-PP/palet/internal/project"
 	"github.com/Thitipong-PP/palet/internal/search"
 	"github.com/Thitipong-PP/palet/internal/validator"
 )
@@ -46,10 +47,12 @@ var (
 	styleError    = lipgloss.NewStyle().Foreground(cRed)
 	styleOk       = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
 
+	cHighlight = lipgloss.Color("#ffb86c") // high-contrast gold/amber for search highlights
+
 	styleSelName  = lipgloss.NewStyle().Foreground(cText).Bold(true)
 	styleSelBar   = lipgloss.NewStyle().Foreground(cBrand)
-	styleMatch    = lipgloss.NewStyle().Foreground(cBrand).Bold(true).Underline(true)
-	styleSelMatch = lipgloss.NewStyle().Foreground(cBrand).Background(cSelBg).Bold(true).Underline(true)
+	styleMatch    = lipgloss.NewStyle().Foreground(cHighlight).Bold(true)
+	styleSelMatch = lipgloss.NewStyle().Foreground(cHighlight).Background(cSelBg).Bold(true)
 
 	styleGroupBar  = lipgloss.NewStyle().Foreground(cBrand)
 	styleGroupName = lipgloss.NewStyle().Foreground(cBrand2).Bold(true)
@@ -94,9 +97,10 @@ type group struct {
 }
 
 type model struct {
-	all    []index.Entry // immutable full command set
-	groups []group       // current filtered results, grouped by category
-	flat   []index.Entry // filtered results flattened in display order
+	all         []index.Entry // immutable full command set
+	groups      []group       // current filtered results, grouped by category
+	flat        []index.Entry // filtered results flattened in display order
+	projectInfo project.Info  // detected project context
 
 	state viewState
 
@@ -182,8 +186,10 @@ func StartWithOptions(entries []index.Entry, opts Options) error {
 		si.SetValue(initQ)
 	}
 
+	projInfo := project.Detect("")
 	m := model{
 		all:         entries,
+		projectInfo: projInfo,
 		searchInput: si,
 		state:       viewList,
 	}
@@ -396,10 +402,51 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) applySearch(query string) {
 	changed := query != m.lastQuery
 	m.lastQuery = query
-	results := search.Query(m.all, query)
+	results := search.QueryWithContext(m.all, query, m.projectInfo.Suggestions)
 	m.groups = buildGroups(results)
 
 	if query == "" {
+		// 1. Context Suggestions (top priority)
+		if len(m.projectInfo.Suggestions) > 0 {
+			var suggEntries []index.Entry
+			seenSugg := make(map[string]bool)
+			for _, sugg := range m.projectInfo.Suggestions {
+				suggLower := strings.ToLower(sugg)
+				for _, e := range m.all {
+					fullName := strings.ToLower(e.Group.Name + " " + e.Command.Name)
+					cmdName := strings.ToLower(e.Command.Name)
+					tmpl := strings.ToLower(e.Command.Template)
+					if (fullName == suggLower || cmdName == suggLower || tmpl == suggLower || strings.HasPrefix(fullName, suggLower) || strings.HasPrefix(cmdName, suggLower)) && !seenSugg[fullName] {
+						cmdCopy := e.Command
+						displayName := e.Command.Name
+						if e.Group.Name != "" && e.Group.Name != "system" && !strings.HasPrefix(e.Command.Name, e.Group.Name) {
+							displayName = e.Group.Name + " " + e.Command.Name
+						} else if e.Command.Template != "" && !strings.Contains(e.Command.Template, "{{") {
+							displayName = e.Command.Template
+						}
+						cmdCopy.Name = displayName
+
+						suggEntries = append(suggEntries, index.Entry{
+							Group: config.Group{
+								Name:        "suggested",
+								Description: "recommended for current project",
+							},
+							Command: cmdCopy,
+						})
+						seenSugg[fullName] = true
+						break
+					}
+				}
+				if len(suggEntries) >= 6 {
+					break
+				}
+			}
+			if len(suggEntries) > 0 {
+				m.groups = append([]group{{name: "suggested for project", entries: suggEntries}}, m.groups...)
+			}
+		}
+
+		// 2. Recent commands
 		recentList := history.Recent()
 		if len(recentList) > 0 {
 			var recentEntries []index.Entry
@@ -411,12 +458,21 @@ func (m *model) applySearch(query string) {
 						key = e.Command.Name
 					}
 					if (key == rcmd || e.Command.Name == rcmd || strings.HasPrefix(rcmd, key)) && !seen[key] {
+						cmdCopy := e.Command
+						displayName := e.Command.Name
+						if e.Group.Name != "" && e.Group.Name != "system" && !strings.HasPrefix(e.Command.Name, e.Group.Name) {
+							displayName = e.Group.Name + " " + e.Command.Name
+						} else if e.Command.Template != "" && !strings.Contains(e.Command.Template, "{{") {
+							displayName = e.Command.Template
+						}
+						cmdCopy.Name = displayName
+
 						recentEntries = append(recentEntries, index.Entry{
 							Group: config.Group{
 								Name:        "recent",
 								Description: "recently used commands",
 							},
-							Command: e.Command,
+							Command: cmdCopy,
 						})
 						seen[key] = true
 						break
@@ -486,7 +542,7 @@ func (m *model) moveCursor(delta int) {
 func (m model) viewList() string {
 	if m.showHelp {
 		var b strings.Builder
-		b.WriteString("\n" + m.topBar(cwdLabel()) + "\n\n")
+		b.WriteString("\n" + m.topBar(m.headerContext()) + "\n\n")
 		b.WriteString(m.logoIcon() + "\n\n")
 		b.WriteString(m.viewHelpModal() + "\n\n")
 		b.WriteString(renderHints([]keyHint{{"esc / ? / q", "close help"}}))
@@ -494,7 +550,7 @@ func (m model) viewList() string {
 	}
 
 	var b strings.Builder
-	b.WriteString("\n" + m.topBar(cwdLabel()) + "\n\n")
+	b.WriteString("\n" + m.topBar(m.headerContext()) + "\n\n")
 	b.WriteString(m.logoIcon() + "\n\n")
 	b.WriteString(m.searchView() + "\n\n")
 
@@ -616,9 +672,11 @@ func (m model) listRows() (rows []string, cursorRow int) {
 }
 
 func (m model) renderEntry(e index.Entry, selected bool) string {
-	const nameW = 16
+	const nameW = 20
 	name := e.Command.Name
-	if e.Group.Description == "system command" && e.Command.Name != e.Group.Name {
+	if e.Group.Description == "system command" &&
+		e.Command.Name != e.Group.Name &&
+		!strings.HasPrefix(e.Command.Name, e.Group.Name) {
 		name = e.Group.Name + " " + e.Command.Name
 	}
 	desc := e.Command.Description
@@ -636,6 +694,7 @@ func (m model) renderEntry(e index.Entry, selected bool) string {
 		}
 		tagStr = strings.Join(tagPills, " ")
 	}
+	tagIndices := search.MatchIndices(tagStr, q)
 
 	if selected {
 		nameRendered := highlight(name, nameIndices, styleSelName.Background(cSelBg), styleSelMatch)
@@ -646,7 +705,8 @@ func (m model) renderEntry(e index.Entry, selected bool) string {
 			inner += "  " + descRendered
 		}
 		if tagStr != "" {
-			inner += lipgloss.NewStyle().Foreground(cBrand2).Background(cSelBg).Render("  " + tagStr)
+			tagRendered := highlight(tagStr, tagIndices, lipgloss.NewStyle().Foreground(cBrand2).Background(cSelBg), styleSelMatch)
+			inner += "  " + tagRendered
 		}
 		row := lipgloss.NewStyle().Background(cSelBg).Width(max(4, m.w()-5)).Render(inner)
 		return styleSelBar.Render("▌") + row
@@ -660,7 +720,8 @@ func (m model) renderEntry(e index.Entry, selected bool) string {
 		line += "  " + descRendered
 	}
 	if tagStr != "" {
-		line += "  " + styleTag.Render(tagStr)
+		tagRendered := highlight(tagStr, tagIndices, styleTag, styleMatch)
+		line += "  " + tagRendered
 	}
 	return line
 }
@@ -1127,7 +1188,7 @@ func (m model) viewForm() string {
 	var b strings.Builder
 	cmd := m.selected.Command
 
-	b.WriteString("\n" + m.topBar(cwdLabel()) + "\n\n")
+	b.WriteString("\n" + m.topBar(m.headerContext()) + "\n\n")
 	b.WriteString(m.logoIcon() + "\n\n")
 
 	// Breadcrumb: group › command, with description & tags
@@ -1496,4 +1557,16 @@ func cwdLabel() string {
 		return "~" + wd[len(home):]
 	}
 	return filepath.Clean(wd)
+}
+
+// headerContext returns the cwd and detected project summary (e.g. "~/OSS/palet-win  •  Go (palet)").
+func (m model) headerContext() string {
+	lbl := cwdLabel()
+	if m.projectInfo.Summary != "" {
+		if lbl != "" {
+			return lbl + "  •  " + m.projectInfo.Summary
+		}
+		return m.projectInfo.Summary
+	}
+	return lbl
 }
