@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Thitipong-PP/palet/internal/completion"
 	"github.com/Thitipong-PP/palet/internal/config"
 	"github.com/Thitipong-PP/palet/internal/executor"
 	"github.com/Thitipong-PP/palet/internal/history"
@@ -123,6 +124,11 @@ type model struct {
 	selectedFlags  map[string]bool
 	flagCursor     int
 	formSection    int // 0: args inputs, 1: flags section
+
+	// path autocompletion
+	pathCandidates       []string
+	pathCandidateIdx     int
+	pathCandidateLastVal string
 
 	// result view
 	builtCmd    string
@@ -345,20 +351,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "ctrl+r":
 		if len(m.flat) > 0 {
-			e := m.flat[m.cursor]
-			vals := make(map[string]string)
-			for _, a := range e.Command.Args {
-				vals[a.Name] = a.Default
-			}
-			cmd, err := executor.BuildCommand(e.Command.Template, vals)
-			if err != nil || cmd == "" {
-				cmd = e.Command.Template
-				if cmd == "" {
-					cmd = e.Command.Name
-				}
-			}
-			m.builtCmd = cmd
-			m.pendingAction = "execute"
+			m.executeDirectly(m.flat[m.cursor])
 			return m, tea.Quit
 		}
 		return m, nil
@@ -381,8 +374,20 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "enter":
 		if len(m.flat) > 0 {
-			cmd := m.openForm(m.flat[m.cursor])
-			return m, cmd
+			e := m.flat[m.cursor]
+			// 1-Tap Instant Execution if command has no required arguments
+			if !hasRequiredArgs(e.Command) {
+				m.executeDirectly(e)
+				return m, tea.Quit
+			}
+			return m, m.openForm(e)
+		}
+		return m, nil
+
+	case "tab", "right":
+		// Tab or Right Arrow opens form to customize flags or targets
+		if len(m.flat) > 0 {
+			return m, m.openForm(m.flat[m.cursor])
 		}
 		return m, nil
 	}
@@ -396,6 +401,32 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.applySearch(m.searchInput.Value())
 	}
 	return m, cmd
+}
+
+func (m *model) executeDirectly(e index.Entry) {
+	vals := make(map[string]string)
+	for _, a := range e.Command.Args {
+		vals[a.Name] = a.Default
+	}
+	cmd, err := executor.BuildCommand(e.Command.Template, vals)
+	if err != nil || cmd == "" {
+		cmd = e.Command.Template
+		if cmd == "" {
+			cmd = e.Command.Name
+		}
+	}
+	_ = history.Record(cmd)
+	m.builtCmd = cmd
+	m.pendingAction = "execute"
+}
+
+func hasRequiredArgs(cmd config.Command) bool {
+	for _, a := range cmd.Args {
+		if a.Required {
+			return true
+		}
+	}
+	return false
 }
 
 // applySearch refilters the entries and rebuilds the grouped + flat views.
@@ -578,7 +609,7 @@ func (m model) viewList() string {
 	}
 
 	b.WriteString("\n" + renderHints([]keyHint{
-		{"↑/↓", "navigate"}, {"enter", "select"}, {"ctrl+r", "quick run"}, {"ctrl+o", "copy"}, {"?", "help"}, {"q", "quit"},
+		{"↑/↓", "navigate"}, {"enter", "run"}, {"tab", "customize / flags"}, {"ctrl+o", "copy"}, {"?", "help"}, {"q", "quit"},
 	}))
 	return b.String()
 }
@@ -615,7 +646,7 @@ func (m model) viewHelpModal() string {
 		{
 			title: "Arguments & Flags Form",
 			keys: []keyHint{
-				{"tab", "Next field / switch to flags"},
+				{"tab", "Autocomplete path / next field"},
 				{"shift+tab", "Previous field"},
 				{"ctrl+n / ctrl+p", "Cycle options for choices / enums"},
 				{"space", "Toggle flag [✓] / [ ] or bool"},
@@ -829,6 +860,15 @@ func (m model) windowBounds(total int) (top, bottom int) {
 // ---------------------------------------------------------------------------
 
 func (m *model) openForm(e index.Entry) tea.Cmd {
+	if len(e.Command.Args) == 0 {
+		cmdLookup := e.Command.Template
+		if cmdLookup == "" {
+			cmdLookup = e.Command.Name
+		}
+		if detectedArg := completion.DetectCommandArg(cmdLookup); detectedArg != nil {
+			e.Command.Args = []config.Arg{*detectedArg}
+		}
+	}
 	m.selected = e
 	m.formErr = ""
 	m.focus = 0
@@ -943,6 +983,11 @@ func (m model) currentPreviewCmd() string {
 	if len(activeFlags) > 0 {
 		cmd += " " + strings.Join(activeFlags, " ")
 	}
+	for _, arg := range m.selected.Command.Args {
+		if val := strings.TrimSpace(vals[arg.Name]); val != "" && !strings.Contains(m.selected.Command.Template, "{{") {
+			cmd += " " + val
+		}
+	}
 	return cmd
 }
 
@@ -957,7 +1002,38 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "tab":
-		if m.formSection == 0 {
+		if m.formSection == 0 && len(m.inputs) > 0 && m.focus >= 0 && m.focus < len(m.selected.Command.Args) {
+			arg := m.selected.Command.Args[m.focus]
+			curVal := m.inputs[m.focus].Value()
+
+			// If we already have multiple candidates and user is cycling through them
+			if len(m.pathCandidates) > 1 && m.pathCandidateLastVal == curVal {
+				m.pathCandidateIdx = (m.pathCandidateIdx + 1) % len(m.pathCandidates)
+				chosen := m.pathCandidates[m.pathCandidateIdx]
+				m.inputs[m.focus].SetValue(chosen)
+				m.inputs[m.focus].SetCursor(len(chosen))
+				m.pathCandidateLastVal = chosen
+				return m, nil
+			}
+
+			res := completion.CompleteSemantic(arg.Type, curVal)
+			if len(res.Candidates) > 0 {
+				m.pathCandidates = res.Candidates
+				m.pathCandidateIdx = 0
+				target := res.CommonPrefix
+				if target == "" || target == curVal {
+					target = res.Candidates[0]
+				}
+				if target != curVal {
+					m.inputs[m.focus].SetValue(target)
+					m.inputs[m.focus].SetCursor(len(target))
+					m.pathCandidateLastVal = target
+					return m, nil
+				}
+			}
+
+			// If not a path argument or already fully completed, advance to next field
+			m.pathCandidates = nil
 			if m.focus < len(m.inputs)-1 {
 				m.focusField(m.focus + 1)
 				return m, nil
@@ -968,7 +1044,7 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.flagFilter.Focus()
 				return m, nil
 			}
-		} else {
+		} else if m.formSection == 1 {
 			if len(m.inputs) > 0 {
 				m.formSection = 0
 				m.flagFilter.Blur()
@@ -1126,6 +1202,10 @@ func (m *model) focusField(i int) {
 	if i >= len(m.inputs) {
 		i = len(m.inputs) - 1
 	}
+	m.pathCandidates = nil
+	m.pathCandidateIdx = 0
+	m.pathCandidateLastVal = ""
+
 	for j := range m.inputs {
 		if j == i {
 			m.inputs[j].Focus()
@@ -1164,6 +1244,11 @@ func (m model) submitForm() (tea.Model, tea.Cmd) {
 		}
 		if len(activeFlags) > 0 {
 			cmd += " " + strings.Join(activeFlags, " ")
+		}
+		for _, arg := range m.selected.Command.Args {
+			if val := strings.TrimSpace(vals[arg.Name]); val != "" && !strings.Contains(m.selected.Command.Template, "{{") {
+				cmd += " " + val
+			}
 		}
 	}
 
@@ -1241,6 +1326,23 @@ func (m model) viewForm() string {
 			MarginLeft(2).
 			Width(max(10, m.w()-8))
 		b.WriteString(box.Render(m.inputs[i].View()) + "\n")
+
+		if focused && len(m.pathCandidates) > 0 {
+			var candPills []string
+			maxShow := min(5, len(m.pathCandidates))
+			for ci := 0; ci < maxShow; ci++ {
+				cand := m.pathCandidates[ci]
+				if ci == m.pathCandidateIdx {
+					candPills = append(candPills, badge("▶ "+cand, cText, cBrand))
+				} else {
+					candPills = append(candPills, badge(cand, cSubtle, cFainter))
+				}
+			}
+			if len(m.pathCandidates) > maxShow {
+				candPills = append(candPills, styleDim.Render(fmt.Sprintf("+%d more", len(m.pathCandidates)-maxShow)))
+			}
+			b.WriteString("    " + styleDim.Render("Tab to cycle: ") + strings.Join(candPills, " ") + "\n")
+		}
 
 		if arg.Default != "" {
 			b.WriteString("    " + styleDim.Render("default: "+arg.Default) + "\n")
@@ -1361,7 +1463,7 @@ func (m model) viewForm() string {
 	b.WriteString(previewBox + "\n\n")
 
 	b.WriteString(renderHints([]keyHint{
-		{"tab", "switch section"}, {"ctrl+n/p", "cycle options"}, {"space", "toggle flag/bool"}, {"enter", "execute"}, {"esc", "back"},
+		{"tab", "autocomplete / next"}, {"ctrl+n/p", "cycle options"}, {"space", "toggle flag/bool"}, {"enter", "execute"}, {"esc", "back"},
 	}))
 	return b.String()
 }
