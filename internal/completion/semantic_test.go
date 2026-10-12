@@ -6,9 +6,9 @@ import (
 
 func TestDetectCommandArg(t *testing.T) {
 	tests := []struct {
-		cmd          string
-		wantArgName  string
-		wantNil      bool
+		cmd         string
+		wantArgName string
+		wantNil     bool
 	}{
 		{"git status", "", true},
 		{"git log", "", true},

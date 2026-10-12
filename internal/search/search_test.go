@@ -154,4 +154,3 @@ func TestMatchIndices(t *testing.T) {
 		})
 	}
 }
-
