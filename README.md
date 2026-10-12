@@ -4,7 +4,7 @@ A terminal command palette. Search commands, fill in args, and run — no more m
 [![asciicast](https://asciinema.org/a/jlWDyV73A1aAHu9V.svg)](https://asciinema.org/a/jlWDyV73A1aAHu9V)
 
 ## Install
-Build from source (Linux / Debian / Ubuntu):
+Build from source (Debian / Ubuntu / Linux):
 
 ```bash
 git clone https://github.com/AiMlxV/palet
